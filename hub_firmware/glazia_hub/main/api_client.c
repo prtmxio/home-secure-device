@@ -9,8 +9,7 @@
 
 static const char *TAG = "API";
 
-#define SERVER_BASE "http://10.182.205.6:8000"
-#define DEVICE_API_KEY "glazia-dev-key"
+/* IP is defined in state.h — don't redefine here, use that one */
 
 static char resp_buf[1024];
 static int resp_len = 0;
@@ -80,23 +79,28 @@ void api_register_hub(void) {
     if (status == 200 || status == 201) {
         cJSON *root = cJSON_Parse(resp_buf);
         if (root) {
-            cJSON *s = cJSON_GetObjectItem(root, "hubSecret");
+            cJSON *s  = cJSON_GetObjectItem(root, "hubSecret");
             cJSON *id = cJSON_GetObjectItem(root, "homeId");
-            cJSON *n = cJSON_GetObjectItem(root, "homeName");
+            cJSON *n  = cJSON_GetObjectItem(root, "homeName");
+            cJSON *u  = cJSON_GetObjectItem(root, "userName");
 
-            if (cJSON_IsString(s) && s->valuestring) strncpy(g_hub_secret, s->valuestring, sizeof(g_hub_secret)-1);
-            if (cJSON_IsString(id) && id->valuestring) strncpy(g_home_id, id->valuestring, sizeof(g_home_id)-1);
-            if (cJSON_IsString(n) && n->valuestring) strncpy(g_home_name, n->valuestring, sizeof(g_home_name)-1);
+            if (cJSON_IsString(s)  && s->valuestring)  strncpy(g_hub_secret, s->valuestring,  sizeof(g_hub_secret)-1);
+            if (cJSON_IsString(id) && id->valuestring) strncpy(g_home_id,    id->valuestring, sizeof(g_home_id)-1);
+            if (cJSON_IsString(n)  && n->valuestring)  strncpy(g_home_name,  n->valuestring,  sizeof(g_home_name)-1);
+            if (cJSON_IsString(u)  && u->valuestring)  strncpy(g_user_name,  u->valuestring,  sizeof(g_user_name)-1);
 
             cJSON_Delete(root);
         }
 
-        // Store everything in permanent memory!
         nvs_save_credentials();
 
         g_mode = MODE_OPERATIONAL;
-        display_show("Hub Ready!", g_home_name);
-        ESP_LOGI(TAG, "Hub Registered! Home: %s", g_home_name);
+        if (strlen(g_user_name) > 0) {
+            display_show(g_home_name, g_user_name);
+        } else {
+            display_show("Hub Ready!", g_home_name);
+        }
+        ESP_LOGI(TAG, "Hub Registered! Home: %s  User: %s", g_home_name, g_user_name);
     } else {
         display_show("Reg Failed", "Check Server");
         ESP_LOGE(TAG, "Registration failed: %d", status);

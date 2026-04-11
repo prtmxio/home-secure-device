@@ -31,6 +31,8 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
         break;
 
     case WEBSOCKET_EVENT_DATA:
+        /* op_code 0x09 = PING, 0x0A = PONG — skip control frames */
+        if (data->op_code == 0x09 || data->op_code == 0x0A) break;
         if (data->data_len > 0) {
             char *msg = strndup(data->data_ptr, data->data_len);
             ESP_LOGI(TAG, "WS message: %s", msg);

@@ -1,6 +1,7 @@
 #include "wifi.h"
 #include "state.h"
 #include "api_client.h"
+#include "websocket.h"
 #include "display.h"
 #include "espnow.h"
 
@@ -15,11 +16,13 @@
 
 static const char *TAG = "WIFI";
 
+/* Persistent — never deleted so the handler stays valid after initial connect */
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-static int s_retry_num = 0;
+static int  s_retry_num      = 0;
+static bool s_initial_connect = true;   /* true until first successful connection */
 #define WIFI_MAX_RETRIES 10
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -27,20 +30,36 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
+
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < WIFI_MAX_RETRIES) {
-            s_retry_num++;
-            ESP_LOGW(TAG, "Disconnected — retry %d/%d", s_retry_num, WIFI_MAX_RETRIES);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            esp_wifi_connect();
-        } else {
+        s_retry_num++;
+        ESP_LOGW(TAG, "WiFi dropped — retry %d", s_retry_num);
+
+        if (s_initial_connect && s_retry_num >= WIFI_MAX_RETRIES) {
+            /* First-time connect failed too many times — give up */
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        } else {
+            /* Always retry after initial connect — never give up mid-operation */
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            esp_wifi_connect();
+            if (!s_initial_connect) {
+                display_show("WiFi dropped", "Reconnecting...");
+            }
         }
+
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        /* If WiFi recovered mid-operation during sensor pairing — reopen window */
+        if (!s_initial_connect && g_mode == MODE_SENSOR_PAIRING) {
+            ESP_LOGI(TAG, "WiFi back — reopening sensor pairing window");
+            display_show("WiFi back", "Resuming pairing");
+            api_enable_sensor_pairing();
+            websocket_start();
+        }
     }
 }
 
@@ -88,14 +107,22 @@ void wifi_connect(const char *ssid, const char *password)
 
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Connected to AP successfully!");
+        s_initial_connect = false;   /* from here on, always retry on drop */
 
         espnow_init();
 
         if (strlen(g_hub_secret) > 0) {
             // Already registered (loaded from NVS on reboot) — skip re-registration
             g_mode = MODE_OPERATIONAL;
-            display_show("Hub Ready!", g_home_name);
+            if (strlen(g_user_name) > 0) {
+                display_show(g_home_name, g_user_name);
+            } else {
+                display_show("Hub Ready!", g_home_name);
+            }
             ESP_LOGI(TAG, "Already registered, going operational");
+
+            // Restore ESP-NOW links to any previously paired sensors
+            espnow_reconnect_saved_sensors();
         } else {
             // First time — register with server
             display_show("WiFi Connected", "Registering...");
@@ -109,5 +136,5 @@ void wifi_connect(const char *ssid, const char *password)
         esp_restart();
     }
 
-    vEventGroupDelete(s_wifi_event_group);
+    /* Do NOT delete s_wifi_event_group — handler uses it on future disconnects */
 }
