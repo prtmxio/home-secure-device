@@ -79,15 +79,21 @@ void api_register_hub(void) {
     if (status == 200 || status == 201) {
         cJSON *root = cJSON_Parse(resp_buf);
         if (root) {
-            cJSON *s  = cJSON_GetObjectItem(root, "hubSecret");
-            cJSON *id = cJSON_GetObjectItem(root, "homeId");
-            cJSON *n  = cJSON_GetObjectItem(root, "homeName");
-            cJSON *u  = cJSON_GetObjectItem(root, "userName");
+            /* Real backend: { "home": { "id": "...", "name": "..." }, "hubSecret": "..." } */
+            cJSON *secret = cJSON_GetObjectItem(root, "hubSecret");
+            cJSON *home   = cJSON_GetObjectItem(root, "home");
 
-            if (cJSON_IsString(s)  && s->valuestring)  strncpy(g_hub_secret, s->valuestring,  sizeof(g_hub_secret)-1);
-            if (cJSON_IsString(id) && id->valuestring) strncpy(g_home_id,    id->valuestring, sizeof(g_home_id)-1);
-            if (cJSON_IsString(n)  && n->valuestring)  strncpy(g_home_name,  n->valuestring,  sizeof(g_home_name)-1);
-            if (cJSON_IsString(u)  && u->valuestring)  strncpy(g_user_name,  u->valuestring,  sizeof(g_user_name)-1);
+            if (cJSON_IsString(secret) && secret->valuestring)
+                strncpy(g_hub_secret, secret->valuestring, sizeof(g_hub_secret) - 1);
+
+            if (cJSON_IsObject(home)) {
+                cJSON *id   = cJSON_GetObjectItem(home, "id");
+                cJSON *name = cJSON_GetObjectItem(home, "name");
+                if (cJSON_IsString(id)   && id->valuestring)
+                    strncpy(g_home_id,   id->valuestring,   sizeof(g_home_id) - 1);
+                if (cJSON_IsString(name) && name->valuestring)
+                    strncpy(g_home_name, name->valuestring, sizeof(g_home_name) - 1);
+            }
 
             cJSON_Delete(root);
         }
@@ -95,12 +101,8 @@ void api_register_hub(void) {
         nvs_save_credentials();
 
         g_mode = MODE_OPERATIONAL;
-        if (strlen(g_user_name) > 0) {
-            display_show(g_home_name, g_user_name);
-        } else {
-            display_show("Hub Ready!", g_home_name);
-        }
-        ESP_LOGI(TAG, "Hub Registered! Home: %s  User: %s", g_home_name, g_user_name);
+        display_show("Hub Ready!", g_home_name);
+        ESP_LOGI(TAG, "Hub Registered! Home: %s  Secret: %.8s...", g_home_name, g_hub_secret);
     } else {
         display_show("Reg Failed", "Check Server");
         ESP_LOGE(TAG, "Registration failed: %d", status);
@@ -110,19 +112,12 @@ void api_register_hub(void) {
 void api_enable_sensor_pairing(void) {
     ESP_LOGI(TAG, "Opening sensor pairing window...");
     int status = do_post("/api/device/hubs/sensor-pairing-mode", "{}", "X-Hub-Secret", g_hub_secret);
-    if (status == 200) {
+    if (status == 200 || status == 201) {
         ESP_LOGI(TAG, "Pairing mode active on server");
         display_show("PAIRING MODE", "Scan Sensor QR");
     } else {
         ESP_LOGE(TAG, "Failed to enable pairing: %d", status);
     }
-}
-
-void api_acknowledge_sensor(const char *sensor_mac) {
-    ESP_LOGI(TAG, "Acknowledging sensor: %s", sensor_mac);
-    char body[128];
-    snprintf(body, sizeof(body), "{\"sensorMacAddress\":\"%s\"}", sensor_mac);
-    do_post("/api/device/hubs/sensors/acknowledge", body, "X-Hub-Secret", g_hub_secret);
 }
 
 void api_send_event(const char *sensor_mac, const char *event_type, const char *severity) {

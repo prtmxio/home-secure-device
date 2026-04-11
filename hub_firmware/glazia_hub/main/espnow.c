@@ -107,7 +107,6 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
         entry->paired = true;
 
         display_show("Sensor Paired!", mac_str);
-        api_acknowledge_sensor(mac_str);
 
         /* Persist the full sensor MAC list so it survives hub reboots */
         char saved_macs[MAX_SENSORS][18];

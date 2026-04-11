@@ -24,10 +24,10 @@ extern char g_user_name[64];
 
 // ── Server Config ─────────────────────────────────────────────────────────
 #define SERVER_IP      "10.245.180.6"
-#define SERVER_PORT    8000
-#define SERVER_BASE    "http://10.245.180.6:8000"
-#define WS_URI         "ws://10.245.180.6:8000/api/device/hubs/ws"
-#define DEVICE_API_KEY "glazia-dev-key"
+#define SERVER_PORT    3000
+#define SERVER_BASE    "http://10.245.180.6:3000"
+#define WS_URI         "ws://10.245.180.6:3000/api/device/hubs/ws"
+#define DEVICE_API_KEY "glazia-device-dev-key"
 #define BLE_DEVICE_NAME "GlaziaHub"
 
 // ── ESP32-S3 GPIO PINS ────────────────────────────────────────────────────

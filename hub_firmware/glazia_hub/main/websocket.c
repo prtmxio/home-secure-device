@@ -88,8 +88,8 @@ void websocket_start(void)
     //  so we pass mac and secret as query params)
     char uri[256];
     snprintf(uri, sizeof(uri),
-        "ws://" SERVER_IP ":%d/api/device/hubs/ws?mac=%s&secret=%s",
-        SERVER_PORT, g_hub_mac, g_hub_secret);
+        "ws://" SERVER_IP ":%d/api/device/hubs/ws?mac=%s&secret=%s&apiKey=%s",
+        SERVER_PORT, g_hub_mac, g_hub_secret, DEVICE_API_KEY);
 
     esp_websocket_client_config_t ws_cfg = {
         .uri = uri,
