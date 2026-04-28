@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 // Initialise ESP-NOW and register callbacks.
 // Sets the global PMK so encrypted peers can be added.
@@ -15,3 +16,8 @@ void espnow_pair_sensor(const char *sensor_mac_str, const char *provision_key_he
 // On reboot: load saved sensor MACs + LMK keys from NVS and re-add each as an
 // encrypted ESP-NOW peer. Does NOT send HELLO (sensors reconnect on their own).
 void espnow_reconnect_saved_sensors(void);
+
+// Fill `out` with a semicolon-separated sensor list for the display:
+//   "S1|Unknown|ON;S2|Unknown|OFF;..."
+// Caller supplies the output buffer and its size.
+void espnow_get_sensor_list_str(char *out, size_t out_len);

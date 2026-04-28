@@ -12,6 +12,7 @@
 #include "freertos/queue.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static const char *TAG = "ESPNOW";
 
@@ -111,6 +112,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
         entry->paired = true;
 
         display_show("Sensor Paired!", mac_str);
+        display_sensor_list();
 
         // Clear provisional NVS (may already be empty on reconnect — that's fine)
         nvs_prov_clear();
@@ -133,7 +135,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
         }
 
         ESP_LOGI(TAG, "Event from %s: %s", mac_str, pkt->payload);
-        display_show("SENSOR DATA", pkt->payload);
+        char ev_line[96];
+        snprintf(ev_line, sizeof(ev_line), "Sensor Data Incoming: %.60s", pkt->payload);
+        display_show(ev_line, NULL);
+        display_sensor_location(mac_str);
 
         event_item_t item;
         strncpy(item.mac_str, mac_str, sizeof(item.mac_str) - 1);
@@ -268,10 +273,34 @@ void espnow_pair_sensor(const char *sensor_mac_str, const char *provision_key_he
     start_hello_retry(entry, 300, false);
 }
 
+void espnow_get_sensor_list_str(char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    if (s_sensor_count == 0) return;
+
+    size_t pos = 0;
+    for (int i = 0; i < s_sensor_count; i++) {
+        const char *sep = (i < s_sensor_count - 1) ? ";" : "";
+        int n = snprintf(out + pos, out_len - pos,
+                         "S%d|Unknown|%s%s",
+                         i + 1,
+                         s_sensors[i].paired ? "ON" : "OFF",
+                         sep);
+        if (n < 0 || (size_t)n >= out_len - pos) break;
+        pos += (size_t)n;
+    }
+}
+
 void espnow_reconnect_saved_sensors(void)
 {
-    char    macs[MAX_SENSORS][18];
-    uint8_t keys[MAX_SENSORS][16];
+    char    (*macs)[18] = malloc(MAX_SENSORS * sizeof(*macs));
+    uint8_t (*keys)[16] = malloc(MAX_SENSORS * sizeof(*keys));
+    if (!macs || !keys) {
+        ESP_LOGE(TAG, "OOM in espnow_reconnect_saved_sensors");
+        free(macs); free(keys);
+        return;
+    }
     int count = nvs_load_sensors(macs, keys, MAX_SENSORS);
 
     if (count == 0) {
@@ -308,4 +337,10 @@ void espnow_reconnect_saved_sensors(void)
         // 20 retries (60s) to account for sensor boot time.
         start_hello_retry(entry, 150, true);
     }
+
+    free(macs);
+    free(keys);
+
+    // Push initial sensor list to display (all OFF until ACK received)
+    display_sensor_list();
 }

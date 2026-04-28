@@ -119,6 +119,7 @@ void wifi_connect(const char *ssid, const char *password)
             } else {
                 display_show("Hub Ready!", g_home_name);
             }
+            display_hub_location(g_home_name);
             ESP_LOGI(TAG, "Already registered, going operational");
             espnow_reconnect_saved_sensors();
 

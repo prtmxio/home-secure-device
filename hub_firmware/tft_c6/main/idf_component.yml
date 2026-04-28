@@ -12,3 +12,7 @@ dependencies:
   # ILI9341 panel driver (2.8" KMRTM28028-SPI)
   espressif/esp_lcd_ili9341:
     version: "^1.0.0"
+
+  # XPT2046 resistive touch controller
+  espressif/esp_lcd_touch_xpt2046:
+    version: "^1.0.0"

@@ -121,6 +121,7 @@ void api_register_hub(void)
         nvs_save_credentials();
         g_mode = MODE_OPERATIONAL;
         display_show("Hub Ready!", g_home_name);
+        display_hub_location(g_home_name);
         ESP_LOGI(TAG, "Hub registered! Home: %s  Secret: %.8s...", g_home_name, g_hub_secret);
     } else {
         display_show("Reg Failed", "Check Server");

@@ -27,9 +27,9 @@ extern char g_pending_sensor_mac[18];    // e.g. "AA:BB:CC:DD:EE:FF"
 extern char g_pending_provision_key[33]; // 32-char hex of 16-byte LMK
 
 // ── Server Config ─────────────────────────────────────────────────────────
-#define SERVER_IP      "10.208.134.6"
+#define SERVER_IP      "10.148.212.6"
 #define SERVER_PORT    3000
-#define SERVER_BASE    "http://10.208.134.6:3000"
+#define SERVER_BASE    "http://10.148.212.6:3000"
 #define DEVICE_API_KEY "glazia-device-dev-key"
 #define BLE_DEVICE_NAME "GlaziaHub"
 
@@ -41,9 +41,12 @@ extern char g_pending_provision_key[33]; // 32-char hex of 16-byte LMK
 // ── ESP32-S3 GPIO PINS ────────────────────────────────────────────────────
 #define BUTTON_GPIO   21   // General purpose GPIO, safe on ESP32-S3-N16R8
 
-// Display — S3 talks to ESP32-C6 over UART; C6 drives the TFT via LVGL
-// Wire: S3 GPIO17 → C6 GPIO9 (RX)
-//       S3 GPIO18 ← C6 GPIO14 (TX, optional — only needed for ALIVE heartbeat)
-//       GND shared between both boards
-#define DISP_UART_TX  17
-#define DISP_UART_RX  18
+// Display — S3 drives ILI9341 TFT directly over SPI (no C6 bridge)
+// GPIO4 (MOSI) is intentionally off the SPI2 IOMUX to force GPIO-matrix routing.
+// Wire: MOSI=GPIO4, SCK=GPIO12, CS=GPIO10, DC=GPIO13, RST=GPIO14
+//       LED/BL → 3.3 V, GND shared
+#define LCD_PIN_MOSI   4
+#define LCD_PIN_SCK   12
+#define LCD_PIN_CS    10
+#define LCD_PIN_DC    13
+#define LCD_PIN_RST   14

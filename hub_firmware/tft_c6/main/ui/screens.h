@@ -7,8 +7,6 @@
 extern "C" {
 #endif
 
-// Screens
-
 enum ScreensEnum {
     _SCREEN_ID_FIRST = 1,
     SCREEN_ID_MAIN = 1,
@@ -17,8 +15,9 @@ enum ScreensEnum {
 
 typedef struct _objects_t {
     lv_obj_t *main;
-    lv_obj_t *toggle;
-    lv_obj_t *status_label;   // updatable from cmd_status()
+    lv_obj_t *sensor_data_label;    // "Sensor Data Incoming: <data>"
+    lv_obj_t *hub_location_label;   // "Location: <hub_id>"
+    lv_obj_t *sensor_list_label;    // scrollable sensor list text
 } objects_t;
 
 extern objects_t objects;

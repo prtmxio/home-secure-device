@@ -128,7 +128,8 @@ static void ui_build(void)
     lv_scr_load(objects.main);
     lvgl_port_unlock();
 
-    ESP_LOGI(TAG, "EEZ UI loaded — status_label=%p", (void *)objects.status_label);
+    ESP_LOGI(TAG, "EEZ UI loaded — sensor_data=%p list=%p",
+             (void *)objects.sensor_data_label, (void *)objects.sensor_list_label);
 }
 
 /* ── EEZ tick task ───────────────────────────────────────────────────────── */
@@ -146,10 +147,15 @@ static void ui_tick_task(void *arg)
 
 /* ── Command handlers ────────────────────────────────────────────────────── */
 
-// STATUS:line1|line2  — update the status panel, | becomes newline
+/*
+ * STATUS:text
+ *   Updates ONLY sensor_data_label.
+ *   '|' in the payload becomes a newline (two-line system messages from hub).
+ *   Does NOT touch hub_location_label — that is only updated by HUB_LOC:.
+ */
 static void cmd_status(const char *msg)
 {
-    if (!objects.status_label) return;
+    if (!objects.sensor_data_label) return;
 
     char text[128] = {0};
     strncpy(text, msg, sizeof(text) - 1);
@@ -158,8 +164,92 @@ static void cmd_status(const char *msg)
     }
 
     lvgl_port_lock(0);
-    lv_label_set_text(objects.status_label, text);
-    lv_obj_align(objects.status_label, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_label_set_text(objects.sensor_data_label, text);
+    lv_obj_align(objects.sensor_data_label, LV_ALIGN_TOP_LEFT, 0, 0);
+    lvgl_port_unlock();
+}
+
+/*
+ * HUB_LOC:location_text  (boot-time hub home name)
+ */
+static void cmd_hub_loc(const char *loc)
+{
+    if (!objects.hub_location_label) return;
+    char buf[72];
+    snprintf(buf, sizeof(buf), "Sensor: %s", loc);
+    lvgl_port_lock(0);
+    lv_label_set_text(objects.hub_location_label, buf);
+    lv_obj_align(objects.hub_location_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lvgl_port_unlock();
+}
+
+/*
+ * SENSOR_LOC:mac_or_name
+ *   Updates the sensor location label with the source of the latest event.
+ */
+static void cmd_sensor_loc(const char *loc)
+{
+    if (!objects.hub_location_label) return;
+    char buf[72];
+    snprintf(buf, sizeof(buf), "From: %s", loc);
+    lvgl_port_lock(0);
+    lv_label_set_text(objects.hub_location_label, buf);
+    lv_obj_align(objects.hub_location_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lvgl_port_unlock();
+}
+
+/*
+ * SENSORS:name1|loc1|status1;name2|loc2|status2;...
+ *   Rebuilds sensor list: "Name : #00FF00 Online#" or "#FF0000 Offline#"
+ *   Recolor markup is enabled on the label (set in screens.c).
+ */
+static void cmd_sensors(const char *payload)
+{
+    if (!objects.sensor_list_label) return;
+
+    char out[512];
+    int  pos = 0;
+
+    char buf[256];
+    strncpy(buf, payload, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *entry = buf;
+    int   count = 0;
+
+    while (entry && *entry && pos < (int)sizeof(out) - 1) {
+        char *next = strchr(entry, ';');
+        if (next) *next++ = '\0';
+
+        char *name   = entry;
+        char *loc    = strchr(name, '|');
+        char *status = NULL;
+        if (loc) {
+            *loc++ = '\0';
+            status = strchr(loc, '|');
+            if (status) *status++ = '\0';
+        }
+
+        bool online = (status && strcmp(status, "ON") == 0);
+        pos += snprintf(out + pos, sizeof(out) - pos,
+                        "%s : %s\n",
+                        name ? name : "?",
+                        online ? "#00FF00 Online#" : "#FF0000 Offline#");
+        count++;
+        entry = next;
+    }
+
+    if (count == 0) {
+        strncpy(out, "No sensors paired yet.\nPress hub button to pair.", sizeof(out) - 1);
+    } else {
+        /* trim trailing newline */
+        int len = (int)strlen(out);
+        if (len > 0 && out[len - 1] == '\n') out[len - 1] = '\0';
+    }
+
+    lvgl_port_lock(0);
+    lv_label_set_text(objects.sensor_list_label, out);
+    lv_obj_align(objects.sensor_list_label, LV_ALIGN_TOP_LEFT, 0, 4);
     lvgl_port_unlock();
 }
 
@@ -170,8 +260,14 @@ static void handle_command(char *line)
 
     if (strncmp(line, "STATUS:", 7) == 0) {
         cmd_status(line + 7);
+    } else if (strncmp(line, "HUB_LOC:", 8) == 0) {
+        cmd_hub_loc(line + 8);
+    } else if (strncmp(line, "SENSOR_LOC:", 11) == 0) {
+        cmd_sensor_loc(line + 11);
+    } else if (strncmp(line, "SENSORS:", 8) == 0) {
+        cmd_sensors(line + 8);
     } else if (strcmp(line, "CLEAR") == 0) {
-        cmd_status("...");
+        cmd_status("---|--");
     } else {
         ESP_LOGW(TAG, "unknown command: %s", line);
     }

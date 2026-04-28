@@ -7,6 +7,7 @@ idf_component_register(
         "api_client.c"
         "espnow.c"
         "display.c"
+        "ui_image_glazia_logo.c"
         "nvs_storage.c"
     INCLUDE_DIRS "."
     REQUIRES
@@ -20,4 +21,6 @@ idf_component_register(
         driver
         spi_flash
         log
+        esp_lcd
+        esp_timer
 )
