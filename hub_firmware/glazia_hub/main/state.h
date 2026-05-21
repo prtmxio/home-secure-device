@@ -9,6 +9,9 @@ typedef enum {
     MODE_REGISTERING,
     MODE_OPERATIONAL,
     MODE_SENSOR_PAIRING,
+    MODE_FINGERPRINT_ENROLL,
+    MODE_FINGERPRINT_VERIFY,
+    MODE_OFFLINE,
 } hub_mode_t;
 
 // ── Global state ──────────────────────────────────────────────────────────
@@ -27,9 +30,9 @@ extern char g_pending_sensor_mac[18];    // e.g. "AA:BB:CC:DD:EE:FF"
 extern char g_pending_provision_key[33]; // 32-char hex of 16-byte LMK
 
 // ── Server Config ─────────────────────────────────────────────────────────
-#define SERVER_IP      "10.148.212.6"
+#define SERVER_IP      "10.82.248.6"
 #define SERVER_PORT    3000
-#define SERVER_BASE    "http://10.148.212.6:3000"
+#define SERVER_BASE    "http://10.82.248.6:3000"
 #define DEVICE_API_KEY "glazia-device-dev-key"
 #define BLE_DEVICE_NAME "GlaziaHub"
 

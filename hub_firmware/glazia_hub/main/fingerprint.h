@@ -6,7 +6,8 @@
 /**
  * R307 Fingerprint Sensor Driver
  *
- * Communicates over UART2 (GPIO43=TX, GPIO44=RX) at 57600 baud.
+ * Communicates over UART2 at 57600 baud.
+ * Wiring: R307 TX -> GPIO43 (ESP RX), R307 RX -> GPIO44 (ESP TX).
  * Stores one master template in R307's onboard flash (slot 1).
  */
 
@@ -37,6 +38,12 @@ esp_err_t fp_verify(void);
 bool fp_is_enrolled(void);
 
 /**
+ * Start post-registration enrollment if no master fingerprint exists.
+ * Returns true when an enrollment task was started or already running.
+ */
+bool fp_start_enroll_if_needed(void);
+
+/**
  * Display callback for showing TFT prompts during enrollment/verification.
  * This is assigned internally; the caller does not need to manage it.
  * Defined to match the signature in display.h: void (*callback)(const char *msg)
@@ -47,9 +54,3 @@ typedef void (*fp_display_cb)(const char *msg);
  * Set the display callback (called by display.c during init).
  */
 void fp_set_display_cb(fp_display_cb cb);
-
-/**
- * Fingerprint verification task (spawned by critical_toggle_cb).
- * Runs asynchronously, verifies a fingerprint, and reverts the toggle if verification fails.
- */
-void fingerprint_verify_task(void *arg);

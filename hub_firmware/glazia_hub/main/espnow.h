@@ -7,6 +7,9 @@
 // Sets the global PMK so encrypted peers can be added.
 void espnow_init(void);
 
+// Stop ESP-NOW for fingerprint-gated hub offline mode.
+void espnow_deinit(void);
+
 // Begin pairing a new sensor using the provision_key as its ESP-NOW LMK.
 // provision_key_hex: 32-char hex string (16 bytes), e.g. "a1b2c3...".
 // On ACK: promotes provisional NVS → main NVS.
@@ -21,3 +24,8 @@ void espnow_reconnect_saved_sensors(void);
 //   "S1|Unknown|ON;S2|Unknown|OFF;..."
 // Caller supplies the output buffer and its size.
 void espnow_get_sensor_list_str(char *out, size_t out_len);
+
+int espnow_get_sensor_count(void);
+bool espnow_get_sensor_info(int index, char *out_name, size_t out_name_len, bool *out_enabled, bool *out_paired);
+void espnow_set_sensor_enabled(int index, bool enabled);
+bool espnow_get_first_sensor_reading(float *out_temp, float *out_hum);

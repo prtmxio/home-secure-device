@@ -2,6 +2,7 @@
 #include "state.h"
 #include "display.h"
 #include "nvs_storage.h"
+#include "fingerprint.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "cJSON.h"
@@ -35,6 +36,13 @@ static int do_request(esp_http_client_method_t method, const char *path,
 
     char url[192];
     snprintf(url, sizeof(url), "%s%s", SERVER_BASE, path);
+    const char *method_name = method == HTTP_METHOD_GET ? "GET" : "POST";
+    bool is_pending_sensor_poll = strcmp(path, "/api/device/hubs/pending-sensor") == 0;
+    bool log_request = !is_pending_sensor_poll;
+
+    if (log_request) {
+        ESP_LOGI(TAG, "HTTP %s %s starting", method_name, path);
+    }
 
     esp_http_client_config_t config = {
         .url           = url,
@@ -62,10 +70,14 @@ static int do_request(esp_http_client_method_t method, const char *path,
     int       status = esp_http_client_get_status_code(client);
 
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "%s %s failed: %s",
-                 method == HTTP_METHOD_GET ? "GET" : "POST",
-                 path, esp_err_to_name(err));
+        ESP_LOGE(TAG, "HTTP %s %s transport failed: %s",
+                 method_name, path, esp_err_to_name(err));
         status = -1;
+    } else {
+        if (log_request || status != 404) {
+            ESP_LOGI(TAG, "HTTP %s %s completed: status=%d bytes=%d",
+                     method_name, path, status, resp_len);
+        }
     }
 
     esp_http_client_cleanup(client);
@@ -87,8 +99,8 @@ static inline int do_get(const char *path)
 
 void api_register_hub(void)
 {
-    ESP_LOGI(TAG, "Registering hub...");
-    display_show("Registering", "Please wait...");
+    size_t token_len = strlen(g_provisioning_token);
+    ESP_LOGI(TAG, "Registering hub mac=%s token_len=%u", g_hub_mac, (unsigned)token_len);
 
     char body[256];
     snprintf(body, sizeof(body),
@@ -118,13 +130,19 @@ void api_register_hub(void)
             cJSON_Delete(root);
         }
 
+        if (strlen(g_hub_secret) == 0) {
+            ESP_LOGE(TAG, "Registration response missing hubSecret");
+            return;
+        }
+
         nvs_save_credentials();
         g_mode = MODE_OPERATIONAL;
-        display_show("Hub Ready!", g_home_name);
+        ESP_LOGI(TAG, "Mode transition: OPERATIONAL after registration");
+        display_show_dashboard(true);
         display_hub_location(g_home_name);
-        ESP_LOGI(TAG, "Hub registered! Home: %s  Secret: %.8s...", g_home_name, g_hub_secret);
+        fp_start_enroll_if_needed();
+        ESP_LOGI(TAG, "Hub registered! Home: %s  Secret prefix: %.8s...", g_home_name, g_hub_secret);
     } else {
-        display_show("Reg Failed", "Check Server");
         ESP_LOGE(TAG, "Registration failed: HTTP %d", status);
     }
 }
@@ -135,7 +153,6 @@ void api_enable_sensor_pairing(void)
     int status = do_post("/api/device/hubs/sensor-pairing-mode", "{}", NULL, NULL);
     if (status == 200 || status == 201) {
         ESP_LOGI(TAG, "Server pairing mode active");
-        display_show("PAIRING MODE", "Waiting for app");
     } else {
         ESP_LOGE(TAG, "Failed to enable pairing: HTTP %d", status);
     }
@@ -143,14 +160,26 @@ void api_enable_sensor_pairing(void)
 
 bool api_fetch_sensor_pairing(char *out_sensor_mac, char *out_provision_key_hex)
 {
+    static uint32_t no_pending_count = 0;
     int status = do_get("/api/device/hubs/pending-sensor");
     if (status != 200) {
-        ESP_LOGD(TAG, "No pending sensor (HTTP %d)", status);
+        no_pending_count++;
+        if (status == 404) {
+            if (no_pending_count == 1 || (no_pending_count % 10) == 0) {
+                ESP_LOGI(TAG, "No pending sensor yet (poll count=%u)", (unsigned)no_pending_count);
+            }
+        } else {
+            ESP_LOGW(TAG, "Pending sensor poll failed: HTTP %d", status);
+        }
         return false;
     }
+    no_pending_count = 0;
 
     cJSON *root = cJSON_Parse(resp_buf);
-    if (!root) return false;
+    if (!root) {
+        ESP_LOGW(TAG, "Pending sensor response JSON parse failed");
+        return false;
+    }
 
     cJSON *mac = cJSON_GetObjectItem(root, "sensorMacAddress");
     cJSON *key = cJSON_GetObjectItem(root, "provisionKey");
@@ -163,19 +192,30 @@ bool api_fetch_sensor_pairing(char *out_sensor_mac, char *out_provision_key_hex)
         strncpy(out_provision_key_hex,  key->valuestring, 32);
         out_sensor_mac[17]        = '\0';
         out_provision_key_hex[32] = '\0';
-        ESP_LOGI(TAG, "Fetched pending sensor: %s", out_sensor_mac);
+        ESP_LOGI(TAG, "Fetched pending sensor: %s provision_key_len=%u",
+                 out_sensor_mac, (unsigned)strlen(out_provision_key_hex));
+    } else {
+        ESP_LOGW(TAG, "Pending sensor response missing sensorMacAddress/provisionKey");
     }
 
     cJSON_Delete(root);
     return ok;
 }
 
-void api_send_event(const char *sensor_mac, const char *event_type, const char *severity)
+bool api_send_event(const char *sensor_mac, const char *event_type, const char *severity, const char *payload_json)
 {
     ESP_LOGI(TAG, "Sending event: %s from %s", event_type, sensor_mac);
-    char body[256];
+    char body[384];
+    const char *payload = (payload_json && payload_json[0] == '{') ? payload_json : "{}";
     snprintf(body, sizeof(body),
-             "{\"sensorMacAddress\":\"%s\",\"eventType\":\"%s\",\"severity\":\"%s\",\"payload\":{}}",
-             sensor_mac, event_type, severity);
-    do_post("/api/device/hubs/events", body, NULL, NULL);
+             "{\"sensorMacAddress\":\"%s\",\"eventType\":\"%s\",\"severity\":\"%s\",\"payload\":%s}",
+             sensor_mac, event_type, severity, payload);
+    int status = do_post("/api/device/hubs/events", body, NULL, NULL);
+    bool ok = status == 200 || status == 201 || status == 202;
+    if (ok) {
+        ESP_LOGI(TAG, "Event accepted by server: status=%d sensor=%s", status, sensor_mac);
+    } else {
+        ESP_LOGW(TAG, "Event send failed: status=%d sensor=%s", status, sensor_mac);
+    }
+    return ok;
 }

@@ -13,5 +13,5 @@ void api_enable_sensor_pairing(void);
 bool api_fetch_sensor_pairing(char *out_sensor_mac, char *out_provision_key_hex);
 
 // Called when sensor sends an event — forwards to server
-void api_send_event(const char *sensor_mac, const char *event_type,
-                    const char *severity);
+bool api_send_event(const char *sensor_mac, const char *event_type,
+                    const char *severity, const char *payload_json);

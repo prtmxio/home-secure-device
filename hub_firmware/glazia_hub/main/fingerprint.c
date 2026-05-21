@@ -1,430 +1,613 @@
 /**
- * fingerprint.c — R307 Capacitive Fingerprint Sensor Driver
+ * R307 fingerprint sensor driver.
  *
- * UART2-based driver for the R307 fingerprint sensor module.
- * Implements the Zhejiang ZLG binary packet protocol for enrollment and verification.
- * Stores one master fingerprint template in the R307's onboard flash (page 1).
+ * Protocol and capture flow are adapted from hub_firmware/fs_test/main/fs_test.c,
+ * which is the verified working ESP-IDF sample for this hardware.
+ *
+ * Wiring for this prototype:
+ *   R307 TX -> ESP32-S3 GPIO43 (UART2 RX)
+ *   R307 RX -> ESP32-S3 GPIO44 (UART2 TX)
  */
 
 #include "fingerprint.h"
+#include "display.h"
 #include "nvs_storage.h"
 #include "state.h"
-#include "esp_log.h"
+
 #include "driver/uart.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
-#include "esp_lvgl_port.h"
+
 #include <string.h>
-#include <stddef.h>
+#include <stdio.h>
 
 static const char *TAG = "FINGERPRINT";
 
-/* ── Configuration ────────────────────────────────────────────────────────── */
-#define FP_UART_NUM          UART_NUM_2
-#define FP_TX_PIN            43
-#define FP_RX_PIN            44
-#define FP_BAUD_RATE         57600
-#define FP_BUF_SIZE          256
-#define FP_RX_TIMEOUT_MS     2000
-#define FP_CMD_TIMEOUT_MS    5000
-#define FP_ENROLL_SLOT       1  /* Store master template in slot 1 */
+#define R307_UART_NUM UART_NUM_2
+#define R307_TX_PIN 44
+#define R307_RX_PIN 43
+#define R307_BAUD_RATE 57600
+#define R307_RX_BUF_SIZE 256
+#define R307_CMD_TIMEOUT_MS 5000
 
-/* ── R307 Protocol Constants ─────────────────────────────────────────────── */
-#define FP_HEADER_1          0xEF
-#define FP_HEADER_2          0x01
-#define FP_ADDR              {0x00, 0x00, 0x00, 0x00}
-#define FP_PKT_CMD           0x01  /* Packet identifier: command */
-#define FP_PKT_DATA          0x07  /* Packet identifier: data */
-#define FP_PKT_ACK           0x07  /* Acknowledgement (same as data) */
-#define FP_PKT_ERROR         0x08  /* Error response */
+#define R307_HEADER_1 0xEF
+#define R307_HEADER_2 0x01
+#define R307_PKT_COMMAND 0x01
+#define R307_PKT_ACK 0x07
 
-/* ── R307 Command Codes ──────────────────────────────────────────────────── */
-#define CMD_GET_IMAGE        0x01
-#define CMD_IMG2TZ           0x02
-#define CMD_MATCH            0x03
-#define CMD_SEARCH           0x04
-#define CMD_REG_MODEL        0x05
-#define CMD_STORE_CHAR       0x06
-#define CMD_LOAD_CHAR        0x07
-#define CMD_DELETE_CHAR      0x08
-#define CMD_EMPTY            0x0D
-#define CMD_GET_PARAM        0x0E
-#define CMD_SET_PARAM        0x0F
+#define R307_CMD_GEN_IMG 0x01
+#define R307_CMD_IMG2TZ 0x02
+#define R307_CMD_SEARCH 0x04
+#define R307_CMD_REG_MODEL 0x05
+#define R307_CMD_STORE 0x06
 
-/* ── Response Confirmation Codes ────────────────────────────────────────── */
-#define CONFIRM_OK           0x00
-#define CONFIRM_FAIL         0x01
-#define CONFIRM_TIMEOUT      0x02
+#define R307_OK 0x00
+#define R307_ERR_PACKET 0x01
+#define R307_ERR_NO_FINGER 0x02
+#define R307_ERR_IMAGE_FAIL 0x03
+#define R307_ERR_IMG2TZ_MESSY 0x06
+#define R307_ERR_IMG2TZ_FEW_POINTS 0x07
+#define R307_ERR_NO_MATCH 0x09
+#define R307_ERR_REG_MODEL_FAIL 0x0A
+#define R307_ERR_BAD_PAGE 0x0B
+#define R307_ERR_FLASH_WRITE 0x18
 
-/* ── Global State ────────────────────────────────────────────────────────── */
-static bool                  s_initialized = false;
-static fp_display_cb         s_display_cb = NULL;
-static QueueHandle_t         s_uart_queue = NULL;
+#define FP_ENROLL_SLOT 1
+#define FP_ID "id_01"
+#define FP_MAX_PRINTS 5
+#define CAPTURE_RETRY_DELAY_MS 500
+#define FP_SCAN_START_DELAY_MS 5000
+#define FP_ENROLL_WINDOW_MS 15000
+#define FP_VERIFY_WINDOW_MS 10000
+#define FP_RETRY_DELAY_MS 2500
+#define FP_VERIFY_ATTEMPTS 3
+#define FP_ENROLL_SECOND_CAPTURE_DELAY_MS 1500
+#define FP_SUCCESS_RESULT_HOLD_MS 900
 
-/* ── Helper: Display Prompt (safe to call anytime) ────────────────────────── */
-static inline void fp_display(const char *msg)
+typedef struct {
+    uint8_t confirm;
+    uint8_t data[32];
+    size_t data_len;
+} r307_response_t;
+
+static bool s_initialized = false;
+static fp_display_cb s_display_cb = NULL;
+static TaskHandle_t s_enroll_task = NULL;
+
+static void fp_display(const char *msg)
 {
     if (s_display_cb) {
         s_display_cb(msg);
     }
 }
 
-/* ── UART Packet Structure ────────────────────────────────────────────────── */
-typedef struct {
-    uint8_t header[2];       /* 0xEF 0x01 */
-    uint8_t address[4];      /* 00 00 00 00 */
-    uint8_t pid;             /* 0x01 = command, 0x07 = data/ack */
-    uint8_t length[2];       /* big-endian: length of data + pid + checksum */
-    uint8_t data[128];       /* command + parameters */
-    uint8_t checksum[2];     /* big-endian */
-} fp_packet_t;
+static bool tick_before(TickType_t now, TickType_t deadline)
+{
+    return (int32_t)(deadline - now) > 0;
+}
 
-/**
- * Calculate checksum (sum of all bytes from pid through data, big-endian).
- */
-static uint16_t fp_checksum(const uint8_t *buf, size_t len)
+static void delay_until_tick(TickType_t deadline)
+{
+    TickType_t now = xTaskGetTickCount();
+    if (tick_before(now, deadline)) {
+        vTaskDelay(deadline - now);
+    }
+}
+
+static void update_window_progress(TickType_t start, TickType_t deadline)
+{
+    TickType_t now = xTaskGetTickCount();
+    if (!tick_before(now, deadline)) {
+        display_fingerprint_progress(100);
+        return;
+    }
+
+    TickType_t total = deadline - start;
+    TickType_t elapsed = now - start;
+    uint8_t percent = total > 0 ? (uint8_t)((elapsed * 100) / total) : 100;
+    display_fingerprint_progress(percent);
+}
+
+static void delay_until_tick_with_progress(TickType_t start, TickType_t deadline, TickType_t wait_until)
+{
+    while (tick_before(xTaskGetTickCount(), wait_until)) {
+        update_window_progress(start, deadline);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+static uint16_t r307_checksum(const uint8_t *data, size_t len)
 {
     uint16_t sum = 0;
+
     for (size_t i = 0; i < len; i++) {
-        sum += buf[i];
+        sum += data[i];
     }
+
     return sum;
 }
 
-/**
- * Build and send a command packet.
- * cmd: command code (CMD_GET_IMAGE, etc.)
- * data: optional command parameters
- * data_len: length of parameters
- */
-static esp_err_t fp_send_cmd(uint8_t cmd, const uint8_t *data, size_t data_len)
+static const char *r307_confirm_name(uint8_t confirm)
 {
-    if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    switch (confirm) {
+    case R307_OK:
+        return "ok";
+    case R307_ERR_PACKET:
+        return "packet receive error";
+    case R307_ERR_NO_FINGER:
+        return "no finger detected";
+    case R307_ERR_IMAGE_FAIL:
+        return "failed to collect finger image";
+    case R307_ERR_IMG2TZ_MESSY:
+        return "image too messy for character file";
+    case R307_ERR_IMG2TZ_FEW_POINTS:
+        return "too few feature points";
+    case R307_ERR_NO_MATCH:
+        return "no matching fingerprint";
+    case R307_ERR_REG_MODEL_FAIL:
+        return "failed to combine character files";
+    case R307_ERR_BAD_PAGE:
+        return "template page is out of range";
+    case R307_ERR_FLASH_WRITE:
+        return "flash write failed";
+    default:
+        return "unknown confirmation code";
+    }
+}
 
-    uint8_t pkt[FP_BUF_SIZE];
-    size_t pkt_len = 0;
+static esp_err_t r307_uart_init(void)
+{
+    const uart_config_t uart_config = {
+        .baud_rate = R307_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
 
-    pkt[pkt_len++] = FP_HEADER_1;
-    pkt[pkt_len++] = FP_HEADER_2;
-    pkt[pkt_len++] = 0x00;
-    pkt[pkt_len++] = 0x00;
-    pkt[pkt_len++] = 0x00;
-    pkt[pkt_len++] = 0x00;
-    pkt[pkt_len++] = FP_PKT_CMD;
-
-    /* Length = 1 (cmd) + data_len + 2 (checksum) */
-    uint16_t len = 1 + data_len + 2;
-    pkt[pkt_len++] = (len >> 8) & 0xFF;
-    pkt[pkt_len++] = len & 0xFF;
-
-    /* Append command code */
-    pkt[pkt_len++] = cmd;
-
-    /* Append parameters */
-    if (data_len > 0) {
-        memcpy(&pkt[pkt_len], data, data_len);
-        pkt_len += data_len;
+    esp_err_t err = uart_driver_install(R307_UART_NUM, R307_RX_BUF_SIZE * 2, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
+        return err;
     }
 
-    /* Calculate and append checksum (from pid to end of data) */
-    uint16_t cs = fp_checksum(&pkt[6], 1 + data_len);
-    pkt[pkt_len++] = (cs >> 8) & 0xFF;
-    pkt[pkt_len++] = cs & 0xFF;
+    err = uart_param_config(R307_UART_NUM, &uart_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART config failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
-    /* Send to UART */
-    uart_write_bytes(FP_UART_NUM, (const char *)pkt, pkt_len);
-    ESP_LOGD(TAG, "Sent cmd 0x%02X, len=%u", cmd, pkt_len);
+    err = uart_set_pin(R307_UART_NUM, R307_TX_PIN, R307_RX_PIN,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART pin config failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
+    ESP_LOGI(TAG, "R307 UART%d initialized: ESP TX=GPIO%d ESP RX=GPIO%d baud=%d",
+             R307_UART_NUM, R307_TX_PIN, R307_RX_PIN, R307_BAUD_RATE);
     return ESP_OK;
 }
 
-/**
- * Receive and parse a response packet.
- * Returns confirmation code (CONFIRM_OK, CONFIRM_FAIL, etc.) or negative on timeout.
- * out_data: optional buffer for response data (beyond confirmation code).
- * out_len: optional output length of data received.
- */
-static int fp_recv_response(uint8_t *out_data, size_t *out_len)
+static esp_err_t r307_send_cmd(uint8_t cmd, const uint8_t *params, size_t params_len)
 {
-    if (!s_initialized) return -1;
-
-    uint8_t buf[FP_BUF_SIZE];
-    size_t idx = 0;
-    int64_t deadline_ms = esp_log_timestamp() + FP_CMD_TIMEOUT_MS;
-
-    /* Read entire packet (header + address + pid + length + data + checksum) */
-    while (idx < FP_BUF_SIZE) {
-        int bytes = uart_read_bytes(FP_UART_NUM, &buf[idx], 1, pdMS_TO_TICKS(100));
-        if (bytes < 0) {
-            if (esp_log_timestamp() > deadline_ms) {
-                ESP_LOGW(TAG, "Response timeout");
-                return -1;
-            }
-            continue;
-        }
-
-        idx += bytes;
-
-        /* Wait for at least header (2) + address (4) + pid (1) + length (2) = 9 bytes */
-        if (idx < 9) continue;
-
-        /* Check header */
-        if (buf[0] != FP_HEADER_1 || buf[1] != FP_HEADER_2) {
-            ESP_LOGW(TAG, "Bad header: %02X %02X", buf[0], buf[1]);
-            return -1;
-        }
-
-        /* Parse length field */
-        uint16_t pkt_len = ((uint16_t)buf[8] << 8) | buf[9];
-        size_t total_needed = 10 + pkt_len;
-
-        if (idx >= total_needed) {
-            /* Full packet received */
-            uint8_t confirm = buf[10];  /* First byte of data is confirmation */
-            ESP_LOGD(TAG, "Response confirm=0x%02X, pkt_len=%u", confirm, pkt_len);
-
-            if (out_data && pkt_len > 1) {
-                size_t data_len = pkt_len - 1 - 2;  /* Exclude confirm + checksum */
-                if (data_len > 0 && out_len) {
-                    memcpy(out_data, &buf[11], data_len);
-                    *out_len = data_len;
-                }
-            }
-
-            return (int)confirm;
-        }
-
-        if (idx >= total_needed) break;
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (params_len > 32) {
+        return ESP_ERR_INVALID_ARG;
     }
 
-    ESP_LOGW(TAG, "Packet too large or incomplete");
-    return -1;
+    uint8_t pkt[48];
+    size_t idx = 0;
+
+    pkt[idx++] = R307_HEADER_1;
+    pkt[idx++] = R307_HEADER_2;
+    pkt[idx++] = 0xFF;
+    pkt[idx++] = 0xFF;
+    pkt[idx++] = 0xFF;
+    pkt[idx++] = 0xFF;
+    pkt[idx++] = R307_PKT_COMMAND;
+
+    const uint16_t pkt_len = (uint16_t)(1 + params_len + 2);
+    pkt[idx++] = (uint8_t)(pkt_len >> 8);
+    pkt[idx++] = (uint8_t)(pkt_len & 0xFF);
+    pkt[idx++] = cmd;
+
+    if (params_len > 0) {
+        memcpy(&pkt[idx], params, params_len);
+        idx += params_len;
+    }
+
+    const uint16_t checksum = r307_checksum(&pkt[6], 4 + params_len);
+    pkt[idx++] = (uint8_t)(checksum >> 8);
+    pkt[idx++] = (uint8_t)(checksum & 0xFF);
+
+    uart_flush_input(R307_UART_NUM);
+
+    const int written = uart_write_bytes(R307_UART_NUM, (const char *)pkt, idx);
+    if (written != (int)idx) {
+        ESP_LOGE(TAG, "UART write failed for cmd 0x%02X: wrote %d/%u",
+                 cmd, written, (unsigned)idx);
+        return ESP_FAIL;
+    }
+
+    ESP_LOG_BUFFER_HEXDUMP(TAG, pkt, idx, ESP_LOG_DEBUG);
+    return ESP_OK;
 }
 
-/**
- * Send command and wait for response.
- * Returns confirmation code on success, or negative on error.
- */
-static int fp_cmd(uint8_t cmd, const uint8_t *data, size_t data_len,
-                  uint8_t *out_data, size_t *out_len)
+static esp_err_t r307_recv_ack(r307_response_t *response)
 {
-    fp_send_cmd(cmd, data, data_len);
-    return fp_recv_response(out_data, out_len);
+    uint8_t header[9];
+    int got = uart_read_bytes(R307_UART_NUM, header, sizeof(header),
+                              pdMS_TO_TICKS(R307_CMD_TIMEOUT_MS));
+    if (got != (int)sizeof(header)) {
+        ESP_LOGW(TAG, "R307 ACK header timeout (%d/%u bytes)", got, (unsigned)sizeof(header));
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (header[0] != R307_HEADER_1 || header[1] != R307_HEADER_2 ||
+        header[6] != R307_PKT_ACK) {
+        ESP_LOGW(TAG, "Bad ACK header: %02X %02X pid=%02X", header[0], header[1], header[6]);
+        return ESP_FAIL;
+    }
+
+    const uint16_t pkt_len = ((uint16_t)header[7] << 8) | header[8];
+    if (pkt_len < 3 || pkt_len > R307_RX_BUF_SIZE) {
+        ESP_LOGW(TAG, "Invalid ACK packet length: %u", pkt_len);
+        return ESP_FAIL;
+    }
+
+    uint8_t body[R307_RX_BUF_SIZE];
+    got = uart_read_bytes(R307_UART_NUM, body, pkt_len, pdMS_TO_TICKS(R307_CMD_TIMEOUT_MS));
+    if (got != pkt_len) {
+        ESP_LOGW(TAG, "R307 ACK body timeout (%d/%u bytes)", got, pkt_len);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uint8_t checksum_data[R307_RX_BUF_SIZE + 3];
+    checksum_data[0] = header[6];
+    checksum_data[1] = header[7];
+    checksum_data[2] = header[8];
+    memcpy(&checksum_data[3], body, pkt_len - 2);
+
+    const uint16_t expected = r307_checksum(checksum_data, 3 + pkt_len - 2);
+    const uint16_t received = ((uint16_t)body[pkt_len - 2] << 8) | body[pkt_len - 1];
+    if (expected != received) {
+        ESP_LOGW(TAG, "ACK checksum mismatch expected=%04X received=%04X", expected, received);
+        return ESP_FAIL;
+    }
+
+    response->confirm = body[0];
+    response->data_len = pkt_len - 3;
+    if (response->data_len > sizeof(response->data)) {
+        response->data_len = sizeof(response->data);
+    }
+    if (response->data_len > 0) {
+        memcpy(response->data, &body[1], response->data_len);
+    }
+
+    ESP_LOGD(TAG, "R307 confirm=0x%02X (%s)", response->confirm,
+             r307_confirm_name(response->confirm));
+    return ESP_OK;
 }
 
-/**
- * Single-argument command helper (common case: command + 1 parameter byte).
- */
-static int fp_cmd1(uint8_t cmd, uint8_t param)
+static esp_err_t r307_cmd(uint8_t cmd, const uint8_t *params, size_t params_len,
+                          r307_response_t *response)
 {
-    return fp_cmd(cmd, &param, 1, NULL, NULL);
+    r307_response_t local_response = {0};
+    if (response == NULL) {
+        response = &local_response;
+    }
+
+    esp_err_t err = r307_send_cmd(cmd, params, params_len);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return r307_recv_ack(response);
 }
 
-/* ── Fingerprint Enrollment ──────────────────────────────────────────────── */
+static uint8_t r307_cmd_confirm(uint8_t cmd, const uint8_t *params, size_t params_len)
+{
+    r307_response_t response = {0};
+    esp_err_t err = r307_cmd(cmd, params, params_len, &response);
+    if (err != ESP_OK) {
+        return 0xFF;
+    }
+
+    return response.confirm;
+}
+
+static bool r307_capture_to_buffer_until(uint8_t buffer_id, TickType_t start, TickType_t deadline)
+{
+    int attempt = 1;
+    while (tick_before(xTaskGetTickCount(), deadline)) {
+        update_window_progress(start, deadline);
+        uint8_t confirm = r307_cmd_confirm(R307_CMD_GEN_IMG, NULL, 0);
+        if (confirm == R307_OK) {
+            const uint8_t params[] = {buffer_id};
+            confirm = r307_cmd_confirm(R307_CMD_IMG2TZ, params, sizeof(params));
+            if (confirm == R307_OK) {
+                ESP_LOGI(TAG, "Captured image into character buffer %u", buffer_id);
+                return true;
+            }
+
+            ESP_LOGW(TAG, "Image conversion failed: 0x%02X (%s)",
+                     confirm, r307_confirm_name(confirm));
+            return false;
+        }
+
+        if (confirm != R307_ERR_NO_FINGER) {
+            ESP_LOGW(TAG, "Capture attempt %d failed: 0x%02X (%s)",
+                     attempt, confirm, r307_confirm_name(confirm));
+        } else if (attempt == 1 || attempt == 5 || attempt == 9) {
+            ESP_LOGI(TAG, "No finger detected yet; keep finger placed on sensor");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(CAPTURE_RETRY_DELAY_MS));
+        attempt++;
+    }
+
+    ESP_LOGW(TAG, "Timed out waiting for a usable fingerprint image");
+    return false;
+}
+
+static esp_err_t fp_enroll_once(uint16_t slot)
+{
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t scan_start = start + pdMS_TO_TICKS(FP_SCAN_START_DELAY_MS);
+    const TickType_t deadline = start + pdMS_TO_TICKS(FP_ENROLL_WINDOW_MS);
+    esp_err_t result = ESP_FAIL;
+
+    ESP_LOGI(TAG, "Enrollment target slot: %u", slot);
+    fp_display("Place finger on sensor");
+    delay_until_tick_with_progress(start, deadline, scan_start);
+
+    if (!r307_capture_to_buffer_until(1, start, deadline)) {
+        goto done;
+    }
+
+    const TickType_t second_capture_at = xTaskGetTickCount() +
+                                         pdMS_TO_TICKS(FP_ENROLL_SECOND_CAPTURE_DELAY_MS);
+    if (!tick_before(second_capture_at, deadline)) {
+        goto done;
+    }
+    delay_until_tick_with_progress(start, deadline, second_capture_at);
+
+    if (!r307_capture_to_buffer_until(2, start, deadline)) {
+        goto done;
+    }
+
+    uint8_t confirm = r307_cmd_confirm(R307_CMD_REG_MODEL, NULL, 0);
+    if (confirm != R307_OK) {
+        ESP_LOGE(TAG, "RegModel failed: 0x%02X (%s)", confirm, r307_confirm_name(confirm));
+        goto done;
+    }
+
+    const uint8_t store_params[] = {
+        0x01,
+        (uint8_t)(slot >> 8),
+        (uint8_t)(slot & 0xFF),
+    };
+    confirm = r307_cmd_confirm(R307_CMD_STORE, store_params, sizeof(store_params));
+    if (confirm != R307_OK) {
+        ESP_LOGE(TAG, "Store failed: 0x%02X (%s)", confirm, r307_confirm_name(confirm));
+        goto done;
+    }
+
+    ESP_LOGI(TAG, "Enrollment complete. Stored fingerprint in R307 slot %u", slot);
+    result = ESP_OK;
+
+done:
+    delay_until_tick(deadline);
+    display_fingerprint_progress(100);
+    if (result == ESP_OK) {
+        fp_display("Fingerprint registered");
+    } else {
+        fp_display("Enrollment failed");
+    }
+    return result;
+}
 
 esp_err_t fp_enroll(void)
 {
-    if (!s_initialized) return ESP_ERR_INVALID_STATE;
-
-    fp_display("Place finger to enroll");
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    /* First scan: Get image and convert to template in buffer 1 */
-    for (int attempt = 0; attempt < 5; attempt++) {
-        fp_display("Scanning... (1/2)");
-        int conf = fp_cmd1(CMD_GET_IMAGE, 0);
-        if (conf == CONFIRM_OK) {
-            conf = fp_cmd1(CMD_IMG2TZ, 1);  /* Buffer 1 */
-            if (conf == CONFIRM_OK) {
-                ESP_LOGI(TAG, "First scan successful");
-                fp_display("Scan 1 complete.\nPlace finger again.");
-                vTaskDelay(pdMS_TO_TICKS(1500));
-                break;
-            }
-        }
-        if (attempt < 4) {
-            fp_display("No finger. Try again.");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+    if (!s_initialized) {
+        ESP_LOGW(TAG, "Fingerprint enrollment requested before driver init");
+        return ESP_ERR_INVALID_STATE;
     }
 
-    /* Second scan: Get image and convert to template in buffer 2 */
-    for (int attempt = 0; attempt < 5; attempt++) {
-        fp_display("Scanning... (2/2)");
-        int conf = fp_cmd1(CMD_GET_IMAGE, 0);
-        if (conf == CONFIRM_OK) {
-            conf = fp_cmd1(CMD_IMG2TZ, 2);  /* Buffer 2 */
-            if (conf == CONFIRM_OK) {
-                ESP_LOGI(TAG, "Second scan successful");
-                break;
-            }
-        }
-        if (attempt < 4) {
-            fp_display("No finger. Try again.");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
-    }
-
-    /* Combine buffers into model */
-    int conf = fp_cmd1(CMD_REG_MODEL, 0);
-    if (conf != CONFIRM_OK) {
-        ESP_LOGE(TAG, "RegModel failed: 0x%02X", conf);
-        fp_display("Enrollment failed.");
+    uint16_t slots[FP_MAX_PRINTS] = {0};
+    uint8_t count = nvs_load_fingerprints(slots, FP_MAX_PRINTS);
+    ESP_LOGI(TAG, "Fingerprint enrollment requested: existing=%u max=%u", count, FP_MAX_PRINTS);
+    if (count >= FP_MAX_PRINTS) {
+        ESP_LOGW(TAG, "Fingerprint enrollment blocked: limit reached");
+        fp_display("Fingerprint limit reached");
         return ESP_FAIL;
     }
 
-    /* Store to R307 onboard flash, page 1 (master template) */
-    uint8_t store_params[] = {FP_ENROLL_SLOT >> 8, FP_ENROLL_SLOT & 0xFF};
-    conf = fp_cmd(CMD_STORE_CHAR, store_params, sizeof(store_params), NULL, NULL);
-    if (conf != CONFIRM_OK) {
-        ESP_LOGE(TAG, "StoreChar failed: 0x%02X", conf);
-        fp_display("Storage failed.");
-        return ESP_FAIL;
-    }
-
-    /* Mark as enrolled in NVS */
-    nvs_save_fp_enrolled(true);
-
-    ESP_LOGI(TAG, "Enrollment successful, template stored in slot %d", FP_ENROLL_SLOT);
-    fp_display("Enrollment complete!");
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    return ESP_OK;
-}
-
-/* ── Fingerprint Verification ────────────────────────────────────────────── */
-
-esp_err_t fp_verify(void)
-{
-    if (!s_initialized) return ESP_ERR_INVALID_STATE;
-    if (!fp_is_enrolled()) {
-        fp_display("No fingerprint enrolled.");
-        return ESP_FAIL;
-    }
-
-    fp_display("Place your finger...");
-
-    /* Capture and convert to buffer 1 */
-    for (int attempt = 0; attempt < 3; attempt++) {
-        int conf = fp_cmd1(CMD_GET_IMAGE, 0);
-        if (conf == CONFIRM_OK) {
-            conf = fp_cmd1(CMD_IMG2TZ, 1);
-            if (conf == CONFIRM_OK) {
-                fp_display("Verifying...");
-                break;
-            }
+    uint16_t slot = (uint16_t)(count + 1);
+    while (count < FP_MAX_PRINTS) {
+        esp_err_t err = fp_enroll_once(slot);
+        if (err == ESP_OK) {
+            slots[count++] = slot;
+            nvs_save_fingerprints(count, slots);
+            char id[8];
+            snprintf(id, sizeof(id), "id_%02u", count);
+            nvs_save_fingerprint(true, id, slot);
+            return ESP_OK;
         }
-        if (attempt < 2) {
-            fp_display("Not detected. Try again.");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+
+        vTaskDelay(pdMS_TO_TICKS(FP_RETRY_DELAY_MS));
     }
 
-    /* Search against all stored templates (master is at slot 1) */
-    uint8_t search_params[] = {
-        0x00, 0x01,      /* Start page 0, search 1 template */
-        0x00, 0x7F,      /* Search up to page 127 (whole database) */
-    };
-    uint8_t search_data[4];
-    size_t search_data_len = sizeof(search_data);
-
-    int conf = fp_cmd(CMD_SEARCH, search_params, sizeof(search_params),
-                      search_data, &search_data_len);
-
-    if (conf == CONFIRM_OK && search_data_len >= 4) {
-        uint16_t match_slot = ((uint16_t)search_data[0] << 8) | search_data[1];
-        uint16_t match_score = ((uint16_t)search_data[2] << 8) | search_data[3];
-        ESP_LOGI(TAG, "Match found: slot=%u, score=%u", match_slot, match_score);
-        fp_display("Access granted!");
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        return ESP_OK;
-    }
-
-    ESP_LOGI(TAG, "No match found");
-    fp_display("Access denied.");
-    vTaskDelay(pdMS_TO_TICKS(1500));
     return ESP_FAIL;
 }
 
-/* ── NVS Integration ─────────────────────────────────────────────────────── */
+static esp_err_t fp_verify_once(int attempt_num)
+{
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t scan_start = start + pdMS_TO_TICKS(FP_SCAN_START_DELAY_MS);
+    const TickType_t deadline = start + pdMS_TO_TICKS(FP_VERIFY_WINDOW_MS);
+    esp_err_t result = ESP_FAIL;
+
+    if (attempt_num == 1) {
+        fp_display("Scan your fingerprint");
+    } else {
+        fp_display("Try fingerprint again");
+    }
+
+    delay_until_tick_with_progress(start, deadline, scan_start);
+
+    if (!r307_capture_to_buffer_until(1, start, deadline)) {
+        goto done;
+    }
+
+    uint16_t slots[FP_MAX_PRINTS] = {0};
+    uint8_t count = nvs_load_fingerprints(slots, FP_MAX_PRINTS);
+    for (uint8_t i = 0; i < count; i++) {
+        const uint8_t search_params[] = {
+            0x01,
+            (uint8_t)(slots[i] >> 8),
+            (uint8_t)(slots[i] & 0xFF),
+            0x00,
+            0x01,
+        };
+
+        r307_response_t response = {0};
+        esp_err_t err = r307_cmd(R307_CMD_SEARCH, search_params, sizeof(search_params), &response);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Search failed for slot %u: %s", slots[i], esp_err_to_name(err));
+            continue;
+        }
+
+        if (response.confirm == R307_OK && response.data_len >= 4) {
+            const uint16_t matched_slot = ((uint16_t)response.data[0] << 8) | response.data[1];
+            const uint16_t score = ((uint16_t)response.data[2] << 8) | response.data[3];
+            ESP_LOGI(TAG, "Match found: slot=%u score=%u", matched_slot, score);
+            result = ESP_OK;
+            goto done;
+        }
+
+        ESP_LOGW(TAG, "Search result slot %u: 0x%02X (%s)",
+                 slots[i], response.confirm, r307_confirm_name(response.confirm));
+    }
+
+done:
+    delay_until_tick(deadline);
+    display_fingerprint_progress(100);
+    if (result == ESP_OK) {
+        fp_display("Access granted");
+    } else {
+        fp_display("Access denied");
+    }
+    return result;
+}
+
+esp_err_t fp_verify(void)
+{
+    if (!s_initialized) {
+        ESP_LOGW(TAG, "Fingerprint verification requested before driver init");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!fp_is_enrolled()) {
+        ESP_LOGW(TAG, "Fingerprint verification blocked: no fingerprint enrolled");
+        fp_display("No fingerprint enrolled");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Fingerprint verification started: attempts=%d", FP_VERIFY_ATTEMPTS);
+    for (int attempt = 1; attempt <= FP_VERIFY_ATTEMPTS; attempt++) {
+        ESP_LOGI(TAG, "Fingerprint verification attempt %d/%d", attempt, FP_VERIFY_ATTEMPTS);
+        esp_err_t err = fp_verify_once(attempt);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Fingerprint verification succeeded on attempt %d", attempt);
+            vTaskDelay(pdMS_TO_TICKS(FP_SUCCESS_RESULT_HOLD_MS));
+            return ESP_OK;
+        }
+
+        if (attempt < FP_VERIFY_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(FP_RETRY_DELAY_MS));
+        }
+    }
+
+    ESP_LOGW(TAG, "Fingerprint verification failed after %d attempts", FP_VERIFY_ATTEMPTS);
+    return ESP_FAIL;
+}
 
 bool fp_is_enrolled(void)
 {
     return nvs_load_fp_enrolled();
 }
 
-/* ── Initialization ──────────────────────────────────────────────────────── */
-
 esp_err_t fp_init(void)
 {
-    if (s_initialized) return ESP_OK;
-
-    /* Configure UART2 */
-    uart_config_t cfg = {
-        .baud_rate = FP_BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_ODD,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-    };
-
-    esp_err_t err = uart_param_config(FP_UART_NUM, &cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "UART config failed: %s", esp_err_to_name(err));
-        return err;
+    if (s_initialized) {
+        return ESP_OK;
     }
 
-    err = uart_set_pin(FP_UART_NUM, FP_TX_PIN, FP_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    esp_err_t err = r307_uart_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "UART set_pin failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = uart_driver_install(FP_UART_NUM, FP_BUF_SIZE, 0, 10, &s_uart_queue, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
         return err;
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "Fingerprint sensor initialized on UART%d", FP_UART_NUM);
-
     return ESP_OK;
 }
 
 void fp_set_display_cb(fp_display_cb cb)
 {
     s_display_cb = cb;
-    ESP_LOGI(TAG, "Display callback registered");
 }
 
-/* ── Fingerprint Verification Task ───────────────────────────────────────── */
-
-void fingerprint_verify_task(void *arg)
+static void fp_enroll_task(void *arg)
 {
-    lv_obj_t *sw = (lv_obj_t *)arg;
+    (void)arg;
 
-    ESP_LOGI(TAG, "Fingerprint verification task started");
+    ESP_LOGI(TAG, "Fingerprint enrollment task started");
+    g_mode = MODE_FINGERPRINT_ENROLL;
+    display_show_fingerprint_screen("Add Fingerprint", "Place your finger on the sensor.");
 
-    /* Perform fingerprint verification */
-    esp_err_t result = fp_verify();
-
-    if (result == ESP_OK) {
-        ESP_LOGI(TAG, "Fingerprint verification successful");
-        g_mode = MODE_OPERATIONAL;
-        /* Toggle remains OFF (verified successfully) */
+    esp_err_t err = fp_enroll();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Fingerprint enrollment complete");
     } else {
-        ESP_LOGW(TAG, "Fingerprint verification failed");
-        g_mode = MODE_OPERATIONAL;
-        /* Revert toggle back to ON if it's still OFF */
-        if (lvgl_port_lock(pdMS_TO_TICKS(100))) {
-            if (!lv_obj_has_state(sw, LV_STATE_CHECKED)) {
-                lv_obj_add_state(sw, LV_STATE_CHECKED);
-            }
-            lvgl_port_unlock();
-        }
+        ESP_LOGW(TAG, "Fingerprint enrollment failed");
     }
 
+    g_mode = MODE_OPERATIONAL;
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(1200));
+        display_show_dashboard(true);
+    }
+    s_enroll_task = NULL;
     vTaskDelete(NULL);
+}
+
+bool fp_start_enroll_if_needed(void)
+{
+    if (!s_initialized) {
+        ESP_LOGW(TAG, "Fingerprint enrollment skipped; driver not initialized");
+        return false;
+    }
+
+    if (fp_is_enrolled()) {
+        ESP_LOGI(TAG, "Fingerprint already enrolled");
+        return false;
+    }
+
+    if (s_enroll_task != NULL) {
+        ESP_LOGI(TAG, "Fingerprint enrollment already running");
+        return true;
+    }
+
+    if (xTaskCreate(fp_enroll_task, "fp_enroll", 4096, NULL, 5, &s_enroll_task) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create fingerprint enrollment task");
+        s_enroll_task = NULL;
+        return false;
+    }
+
+    return true;
 }

@@ -4,6 +4,7 @@
 #include "espnow.h"
 #include "ble.h"
 #include "display.h"
+#include "fingerprint.h"
 #include "nvs_storage.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
@@ -20,6 +21,15 @@ static const char *TAG = "BUTTON";
 
 static TimerHandle_t s_pair_timer = NULL;
 static TaskHandle_t  s_poll_task  = NULL;
+
+static void start_hub_pairing(void)
+{
+    ESP_LOGI(TAG, "Starting hub BLE provisioning from mode %d", g_mode);
+    g_mode = MODE_HUB_PAIRING;
+    ESP_LOGI(TAG, "Mode transition: HUB_PAIRING");
+    display_show("HUB PAIRING", "Connect via BLE");
+    ble_start();
+}
 
 static void pairing_timeout_cb(TimerHandle_t xTimer)
 {
@@ -38,10 +48,12 @@ static void sensor_poll_task(void *arg)
 {
     char sensor_mac[18]    = {0};
     char provision_key[33] = {0};
+    ESP_LOGI(TAG, "Sensor pairing poll task started: interval=%d ms timeout=%d ms",
+             SENSOR_POLL_INTERVAL_MS, SENSOR_PAIR_TIMEOUT_MS);
 
     while (g_mode == MODE_SENSOR_PAIRING) {
         if (api_fetch_sensor_pairing(sensor_mac, provision_key)) {
-            ESP_LOGI(TAG, "Got sensor from server: %s — starting ESP-NOW pair", sensor_mac);
+            ESP_LOGI(TAG, "Pending sensor received: %s. Saving provisional NVS and starting ESP-NOW", sensor_mac);
             nvs_prov_save_sensor(sensor_mac, provision_key);
             espnow_pair_sensor(sensor_mac, provision_key);
 
@@ -55,9 +67,36 @@ static void sensor_poll_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_INTERVAL_MS));
     }
 
-    ESP_LOGI(TAG, "Sensor pairing poll task exiting");
+    ESP_LOGI(TAG, "Sensor pairing poll task exiting, current mode=%d", g_mode);
     s_poll_task = NULL;
     vTaskDelete(NULL);
+}
+
+void sensor_pairing_open_window(void)
+{
+    if (g_mode != MODE_OPERATIONAL && g_mode != MODE_SENSOR_PAIRING) {
+        ESP_LOGW(TAG, "Cannot open sensor pairing from mode %d", g_mode);
+        return;
+    }
+
+    g_mode = MODE_SENSOR_PAIRING;
+    ESP_LOGI(TAG, "Mode transition: SENSOR_PAIRING");
+    api_enable_sensor_pairing();
+
+    if (s_pair_timer) {
+        xTimerReset(s_pair_timer, pdMS_TO_TICKS(100));
+    }
+
+    if (s_poll_task == NULL) {
+        if (xTaskCreate(sensor_poll_task, "sensor_poll", 4096, NULL, 5, &s_poll_task) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create sensor pairing poll task");
+            s_poll_task = NULL;
+        }
+    } else {
+        ESP_LOGI(TAG, "Sensor pairing poll task already running");
+    }
+
+    ESP_LOGI(TAG, "Sensor pairing window opened (2 min)");
 }
 
 // ── Button task ───────────────────────────────────────────────────────────
@@ -70,30 +109,26 @@ void button_task(void *arg)
             if (gpio_get_level(BUTTON_GPIO) == 0) {
                 ESP_LOGI(TAG, "Button pressed! Mode: %d", g_mode);
 
-                if (g_mode == MODE_IDLE) {
-                    // 1st press: start hub BLE pairing
-                    g_mode = MODE_HUB_PAIRING;
-                    display_show("HUB PAIRING", "Connect via BLE");
-                    ble_start();
+                if (strlen(g_hub_secret) == 0 &&
+                    (g_mode == MODE_IDLE || g_mode == MODE_OPERATIONAL || g_mode == MODE_OFFLINE)) {
+                    start_hub_pairing();
 
-                } else if (g_mode == MODE_OPERATIONAL) {
-                    // 2nd press: open pairing window on server, start polling
-                    g_mode = MODE_SENSOR_PAIRING;
-                    display_show("SENSOR PAIRING", "Waiting for app");
-                    api_enable_sensor_pairing();
-
-                    // Start or reset the 2-minute timeout
-                    if (s_pair_timer) {
-                        xTimerReset(s_pair_timer, pdMS_TO_TICKS(100));
+                } else if (g_mode == MODE_OPERATIONAL && strlen(g_hub_secret) > 0) {
+                    ESP_LOGI(TAG, "Registered hub button action: fingerprint gate before sensor pairing");
+                    display_show_fingerprint_screen("Verify Fingerprint", "Scan your fingerprint");
+                    g_mode = MODE_FINGERPRINT_VERIFY;
+                    ESP_LOGI(TAG, "Mode transition: FINGERPRINT_VERIFY");
+                    if (fp_verify() == ESP_OK) {
+                        ESP_LOGI(TAG, "Fingerprint verified. Opening sensor pairing");
+                        g_mode = MODE_OPERATIONAL;
+                        sensor_pairing_open_window();
+                    } else {
+                        ESP_LOGW(TAG, "Fingerprint verification failed. Sensor pairing not opened");
+                        g_mode = MODE_OPERATIONAL;
+                        display_show_dashboard(true);
                     }
-
-                    // Spawn polling task (only one at a time)
-                    if (s_poll_task == NULL) {
-                        xTaskCreate(sensor_poll_task, "sensor_poll", 4096,
-                                    NULL, 5, &s_poll_task);
-                    }
-
-                    ESP_LOGI(TAG, "Sensor pairing window opened (2 min)");
+                } else {
+                    ESP_LOGW(TAG, "Button press ignored in mode %d", g_mode);
                 }
 
                 // Wait for release

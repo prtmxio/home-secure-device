@@ -4,6 +4,7 @@
 #include "display.h"
 #include "espnow.h"
 #include "nvs_storage.h"
+#include "fingerprint.h"
 
 #include "esp_wifi.h"
 #include "esp_log.h"
@@ -22,15 +23,22 @@ static EventGroupHandle_t s_wifi_event_group;
 
 static int  s_retry_num       = 0;
 static bool s_initial_connect = true;
+static bool s_offline_mode    = false;
 #define WIFI_MAX_RETRIES 10
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi STA started; connecting to AP");
         esp_wifi_connect();
 
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_offline_mode) {
+            ESP_LOGI(TAG, "WiFi disconnected for offline mode");
+            return;
+        }
+
         s_retry_num++;
         ESP_LOGW(TAG, "WiFi dropped — retry %d", s_retry_num);
 
@@ -56,10 +64,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             char prov_mac[18] = {0}, prov_key[33] = {0};
             if (nvs_prov_load_sensor(prov_mac, prov_key)) {
                 ESP_LOGI(TAG, "WiFi back — resuming provisional sensor pairing for %s", prov_mac);
-                display_show("WiFi back", "Resuming pair");
                 espnow_pair_sensor(prov_mac, prov_key);
-            } else {
-                display_show("WiFi back", "Reconnected");
             }
         }
     }
@@ -67,17 +72,24 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
 void wifi_connect(const char *ssid, const char *password)
 {
-    ESP_LOGI(TAG, "Preparing WiFi connection...");
-    display_show("WiFi", "Connecting...");
+    ESP_LOGI(TAG, "Preparing WiFi connection to SSID '%s'", ssid ? ssid : "");
 
     s_wifi_event_group = xEventGroupCreate();
+    if (!s_wifi_event_group) {
+        ESP_LOGE(TAG, "Failed to create WiFi event group");
+        return;
+    }
 
-    esp_netif_init();
-    esp_event_loop_create_default();
+    ESP_ERROR_CHECK(esp_netif_init());
+    esp_err_t err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(err));
+        return;
+    }
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                         &wifi_event_handler, NULL, NULL);
@@ -92,14 +104,16 @@ void wifi_connect(const char *ssid, const char *password)
         wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     }
 
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_LOGI(TAG, "WiFi STA config applied; password len=%u", (unsigned)strlen(password));
 
     // Brief delay: lets voltage regulator recover from BLE shutdown
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    esp_wifi_start();
-    esp_wifi_set_max_tx_power(56);   // limit peak current on USB
+    ESP_LOGI(TAG, "Starting WiFi STA");
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(56));   // limit peak current on USB
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -109,37 +123,90 @@ void wifi_connect(const char *ssid, const char *password)
         ESP_LOGI(TAG, "Connected to AP!");
         s_initial_connect = false;
 
+        ESP_LOGI(TAG, "Initializing ESP-NOW after WiFi connect");
         espnow_init();
 
         if (strlen(g_hub_secret) > 0) {
             // Already registered — go operational and restore saved sensors
             g_mode = MODE_OPERATIONAL;
-            if (strlen(g_user_name) > 0) {
-                display_show(g_home_name, g_user_name);
-            } else {
-                display_show("Hub Ready!", g_home_name);
-            }
+            display_show_dashboard(true);
             display_hub_location(g_home_name);
-            ESP_LOGI(TAG, "Already registered, going operational");
+            ESP_LOGI(TAG, "Already registered. Mode transition: OPERATIONAL, home='%s'", g_home_name);
+            fp_start_enroll_if_needed();
             espnow_reconnect_saved_sensors();
 
             // Also check if a sensor pairing was interrupted (provisional NVS)
             char prov_mac[18] = {0}, prov_key[33] = {0};
             if (nvs_prov_load_sensor(prov_mac, prov_key)) {
                 ESP_LOGI(TAG, "Found interrupted sensor pairing — resuming for %s", prov_mac);
-                display_show("Resuming pair", prov_mac);
                 espnow_pair_sensor(prov_mac, prov_key);
             }
         } else {
             // First boot — register with server
-            display_show("WiFi Connected", "Registering...");
+            ESP_LOGI(TAG, "No hub secret present; registering hub with server");
             api_register_hub();
         }
 
     } else if (bits & WIFI_FAIL_BIT) {
         ESP_LOGE(TAG, "Failed to connect to SSID: %s", ssid);
-        display_show("WiFi Error", "Check credentials");
         vTaskDelay(pdMS_TO_TICKS(3000));
         esp_restart();
     }
+}
+
+void wifi_enter_offline_mode(void)
+{
+    ESP_LOGI(TAG, "Entering hub offline mode");
+    s_offline_mode = true;
+    espnow_deinit();
+
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGW(TAG, "esp_wifi_disconnect failed: %s", esp_err_to_name(err));
+    }
+
+    err = esp_wifi_stop();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED) {
+        ESP_LOGW(TAG, "esp_wifi_stop failed: %s", esp_err_to_name(err));
+    }
+    g_mode = MODE_OFFLINE;
+    display_show_dashboard(false);
+}
+
+bool wifi_resume_from_offline_mode(void)
+{
+    ESP_LOGI(TAG, "Resuming hub from offline mode");
+    if (!s_wifi_event_group) {
+        ESP_LOGE(TAG, "WiFi event group missing; cannot resume");
+        return false;
+    }
+
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    s_retry_num = 0;
+    s_offline_mode = false;
+
+    esp_err_t err = esp_wifi_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+        s_offline_mode = true;
+        return false;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE, pdFALSE,
+                                           pdMS_TO_TICKS(20000));
+    if (!(bits & WIFI_CONNECTED_BIT)) {
+        ESP_LOGE(TAG, "WiFi resume timed out");
+        s_offline_mode = true;
+        return false;
+    }
+
+    espnow_init();
+    espnow_reconnect_saved_sensors();
+    g_mode = MODE_OPERATIONAL;
+    ESP_LOGI(TAG, "Mode transition: OPERATIONAL after WiFi resume");
+    display_show_dashboard(true);
+    display_hub_location(g_home_name);
+    return true;
 }

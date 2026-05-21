@@ -74,6 +74,121 @@ void nvs_clear_credentials(void)
     }
 }
 
+void nvs_save_fingerprint(bool enrolled, const char *fingerprint_id, uint16_t slot)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for fingerprint: %s", esp_err_to_name(err));
+        return;
+    }
+
+    nvs_set_u8(h, "fp_enrolled", enrolled ? 1 : 0);
+    nvs_set_str(h, "fp_id", fingerprint_id ? fingerprint_id : "");
+    nvs_set_u16(h, "fp_slot", slot);
+    nvs_commit(h);
+    nvs_close(h);
+
+    ESP_LOGI(TAG, "Fingerprint metadata saved: enrolled=%d id=%s slot=%u",
+             enrolled ? 1 : 0, fingerprint_id ? fingerprint_id : "", slot);
+}
+
+bool nvs_load_fingerprint(bool *out_enrolled, char *out_id, size_t out_id_len, uint16_t *out_slot)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+
+    uint8_t enrolled = 0;
+    esp_err_t err = nvs_get_u8(h, "fp_enrolled", &enrolled);
+    if (err != ESP_OK) {
+        nvs_close(h);
+        return false;
+    }
+
+    if (out_enrolled) *out_enrolled = (enrolled != 0);
+
+    if (out_id && out_id_len > 0) {
+        size_t len = out_id_len;
+        if (nvs_get_str(h, "fp_id", out_id, &len) != ESP_OK) {
+            out_id[0] = '\0';
+        }
+    }
+
+    if (out_slot) {
+        uint16_t slot = 0;
+        if (nvs_get_u16(h, "fp_slot", &slot) == ESP_OK) {
+            *out_slot = slot;
+        } else {
+            *out_slot = 0;
+        }
+    }
+
+    nvs_close(h);
+    return true;
+}
+
+bool nvs_load_fp_enrolled(void)
+{
+    uint16_t slots[5];
+    return nvs_load_fingerprints(slots, 5) > 0;
+}
+
+void nvs_save_fingerprints(uint8_t count, const uint16_t *slots)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for fingerprints: %s", esp_err_to_name(err));
+        return;
+    }
+
+    nvs_set_u8(h, "fp_count", count);
+    nvs_set_u8(h, "fp_enrolled", count > 0 ? 1 : 0);
+    for (uint8_t i = 0; i < count; i++) {
+        char key[12];
+        snprintf(key, sizeof(key), "fp_slot%d", i);
+        nvs_set_u16(h, key, slots[i]);
+    }
+
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "Saved %u fingerprint slot(s)", count);
+}
+
+uint8_t nvs_load_fingerprints(uint16_t *slots, uint8_t max_slots)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return 0;
+
+    uint8_t count = 0;
+    if (nvs_get_u8(h, "fp_count", &count) != ESP_OK) {
+        bool enrolled = false;
+        uint16_t slot = 0;
+        if (nvs_load_fingerprint(&enrolled, NULL, 0, &slot) && enrolled && slot > 0 && slots && max_slots > 0) {
+            slots[0] = slot;
+            nvs_close(h);
+            return 1;
+        }
+        nvs_close(h);
+        return 0;
+    }
+
+    if (count > max_slots) count = max_slots;
+    uint8_t loaded = 0;
+    for (uint8_t i = 0; i < count; i++) {
+        char key[12];
+        snprintf(key, sizeof(key), "fp_slot%d", i);
+        uint16_t slot = 0;
+        if (nvs_get_u16(h, key, &slot) == ESP_OK && slot > 0) {
+            if (slots) slots[loaded] = slot;
+            loaded++;
+        }
+    }
+
+    nvs_close(h);
+    return loaded;
+}
+
 void nvs_save_sensors(const char macs[][18], const uint8_t keys[][16], int count)
 {
     nvs_handle_t h;
@@ -92,6 +207,29 @@ void nvs_save_sensors(const char macs[][18], const uint8_t keys[][16], int count
     nvs_commit(h);
     nvs_close(h);
     ESP_LOGI(TAG, "Saved %d sensor(s) with LMK keys to NVS", count);
+}
+
+void nvs_save_sensor_enabled(int index, bool enabled)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    char key[24];
+    snprintf(key, sizeof(key), "sensor_en_%d", index);
+    nvs_set_u8(h, key, enabled ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+bool nvs_load_sensor_enabled(int index, bool default_enabled)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return default_enabled;
+    char key[24];
+    snprintf(key, sizeof(key), "sensor_en_%d", index);
+    uint8_t value = default_enabled ? 1 : 0;
+    nvs_get_u8(h, key, &value);
+    nvs_close(h);
+    return value != 0;
 }
 
 int nvs_load_sensors(char macs[][18], uint8_t keys[][16], int max_count)

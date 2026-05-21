@@ -26,9 +26,20 @@ static bool got_password = false;
 static bool got_token    = false;
 static uint16_t conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
+static void log_token_summary(const char *label, const char *token)
+{
+    size_t len = token ? strlen(token) : 0;
+    if (len >= 4) {
+        ESP_LOGI(TAG, "%s received: len=%u suffix=%.4s", label, (unsigned)len, token + len - 4);
+    } else {
+        ESP_LOGI(TAG, "%s received: len=%u", label, (unsigned)len);
+    }
+}
+
 // ── NEW: Transition Task ──────────────────────────────────────────────────
 static void transition_to_wifi_task(void *arg)
 {
+    ESP_LOGI(TAG, "Credential handoff task started; stopping BLE before WiFi");
     // Wait 500ms to allow the final BLE ACK to reach the phone/nRF app
     vTaskDelay(pdMS_TO_TICKS(500));
 
@@ -36,6 +47,7 @@ static void transition_to_wifi_task(void *arg)
     ble_stop();
 
     g_mode = MODE_WIFI_CONNECTING;
+    ESP_LOGI(TAG, "Mode transition: WIFI_CONNECTING");
     wifi_connect(g_wifi_ssid, g_wifi_password);
 
     // Delete this temporary task once we hand off to WiFi
@@ -46,15 +58,17 @@ static void transition_to_wifi_task(void *arg)
 static void check_and_proceed(void)
 {
     if (got_ssid && got_password && got_token) {
-        ESP_LOGI(TAG, "All credentials received! SSID: %s Token: %s",
-                 g_wifi_ssid, g_provisioning_token);
+        ESP_LOGI(TAG, "All BLE credentials received for SSID '%s'; starting WiFi transition",
+                 g_wifi_ssid);
         display_show("Got Creds!", "Connecting WiFi");
 
         // Reset the token flag so this doesn't accidentally trigger twice
         got_token = false;
 
         // Spawn the transition task to avoid deadlocking the NimBLE thread
-        xTaskCreate(transition_to_wifi_task, "wifi_trans", 4096, NULL, 5, NULL);
+        if (xTaskCreate(transition_to_wifi_task, "wifi_trans", 4096, NULL, 5, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to create WiFi transition task");
+        }
     }
 }
 
@@ -72,15 +86,17 @@ static int gatt_write_cb(uint16_t conn_h, uint16_t attr_handle,
     if (uuid16 == CHAR_UUID_SSID) {
         strncpy(g_wifi_ssid, buf, sizeof(g_wifi_ssid) - 1);
         got_ssid = true;
-        ESP_LOGI(TAG, "Got SSID: %s", g_wifi_ssid);
+        ESP_LOGI(TAG, "BLE credential received: SSID='%s'", g_wifi_ssid);
     } else if (uuid16 == CHAR_UUID_PASS) {
         strncpy(g_wifi_password, buf, sizeof(g_wifi_password) - 1);
         got_password = true;
-        ESP_LOGI(TAG, "Got Password");
+        ESP_LOGI(TAG, "BLE credential received: password len=%u", (unsigned)strlen(g_wifi_password));
     } else if (uuid16 == CHAR_UUID_TOKEN) {
         strncpy(g_provisioning_token, buf, sizeof(g_provisioning_token) - 1);
         got_token = true;
-        ESP_LOGI(TAG, "Got Token: %s", g_provisioning_token);
+        log_token_summary("BLE provisioning token", g_provisioning_token);
+    } else {
+        ESP_LOGW(TAG, "Write to unknown BLE characteristic 0x%04X len=%u", uuid16, len);
     }
 
     check_and_proceed();
@@ -119,16 +135,19 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             conn_handle = event->connect.conn_handle;
-            ESP_LOGI(TAG, "Phone connected");
+            ESP_LOGI(TAG, "BLE phone connected, handle=%u", conn_handle);
             display_show("BLE Connected", "Send credentials");
         } else {
+            ESP_LOGW(TAG, "BLE connection failed status=%d; restarting advertising", event->connect.status);
             ble_start();
         }
         break;
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "Disconnected");
+        ESP_LOGI(TAG, "BLE disconnected; have ssid=%d pass=%d token=%d",
+                 got_ssid, got_password, got_token);
         conn_handle = BLE_HS_CONN_HANDLE_NONE;
         if (!got_ssid || !got_password || !got_token) {
+            ESP_LOGI(TAG, "BLE credentials incomplete; restarting advertising");
             ble_start();
         }
         break;
@@ -150,21 +169,33 @@ static void start_advertising(void)
     fields.name_len         = strlen(BLE_DEVICE_NAME);
     fields.name_is_complete = 1;
 
-    ble_gap_adv_set_fields(&fields);
-    ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
-                      &adv_params, gap_event_handler, NULL);
-    ESP_LOGI(TAG, "Advertising as '%s'", BLE_DEVICE_NAME);
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE advertising field setup failed rc=%d", rc);
+        return;
+    }
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
+                           &adv_params, gap_event_handler, NULL);
+    if (rc == 0) {
+        ESP_LOGI(TAG, "BLE advertising started as '%s'", BLE_DEVICE_NAME);
+    } else {
+        ESP_LOGE(TAG, "BLE advertising start failed rc=%d", rc);
+    }
 }
 
 static void ble_on_sync(void)
 {
-    uint8_t addr_type; ble_hs_id_infer_auto(0, &addr_type);
+    uint8_t addr_type;
+    int rc = ble_hs_id_infer_auto(0, &addr_type);
+    ESP_LOGI(TAG, "BLE host synced, addr_type=%u rc=%d", addr_type, rc);
     start_advertising();
 }
 
 static void nimble_host_task(void *param)
 {
+    ESP_LOGI(TAG, "NimBLE host task running");
     nimble_port_run();
+    ESP_LOGI(TAG, "NimBLE host task stopped");
     nimble_port_freertos_deinit();
 }
 
@@ -184,6 +215,7 @@ void ble_start(void)
 
 void ble_stop(void)
 {
+    ESP_LOGI(TAG, "Stopping BLE");
     if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         ble_gap_terminate(conn_handle, BLE_ERR_REM_USER_CONN_TERM);
     }

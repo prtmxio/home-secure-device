@@ -7,6 +7,7 @@
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -35,13 +36,18 @@ typedef struct {
 } event_item_t;
 
 static QueueHandle_t s_event_queue = NULL;
+static TaskHandle_t  s_event_task_handle = NULL;
+static bool          s_espnow_ready = false;
 
 static void event_forward_task(void *arg)
 {
+    ESP_LOGI(TAG, "Event forward task started");
     event_item_t item;
     while (1) {
         if (xQueueReceive(s_event_queue, &item, portMAX_DELAY) == pdTRUE) {
-            api_send_event(item.mac_str, item.payload, "info");
+            ESP_LOGI(TAG, "Forwarding queued event from %s to API", item.mac_str);
+            bool ok = api_send_event(item.mac_str, "sensor_data", "info", item.payload);
+            ESP_LOGI(TAG, "Event forward result for %s: %s", item.mac_str, ok ? "accepted" : "failed");
         }
     }
 }
@@ -53,6 +59,10 @@ typedef struct {
     uint8_t mac[6];
     uint8_t lmk[16];   // LMK = provision_key bytes
     bool    paired;    // true once ACK received
+    bool    enabled;
+    bool    has_reading;
+    float   temp;
+    float   hum;
 } sensor_entry_t;
 
 static sensor_entry_t s_sensors[MAX_SENSORS];
@@ -79,6 +89,29 @@ static void hex_to_bytes(const char *hex, uint8_t *out, int out_len)
         char b[3] = { hex[i * 2], hex[i * 2 + 1], '\0' };
         out[i] = (uint8_t)strtol(b, NULL, 16);
     }
+}
+
+static int sensor_index_from_entry(sensor_entry_t *entry)
+{
+    if (!entry) return -1;
+    return (int)(entry - s_sensors);
+}
+
+static void parse_sensor_reading(sensor_entry_t *entry, const char *payload)
+{
+    if (!entry || !payload) return;
+    cJSON *root = cJSON_Parse(payload);
+    if (!root) return;
+
+    cJSON *temp = cJSON_GetObjectItem(root, "temp");
+    cJSON *hum = cJSON_GetObjectItem(root, "hum");
+    if (cJSON_IsNumber(temp) && cJSON_IsNumber(hum)) {
+        entry->temp = (float)temp->valuedouble;
+        entry->hum = (float)hum->valuedouble;
+        entry->has_reading = true;
+    }
+
+    cJSON_Delete(root);
 }
 
 // ── Receive callback ──────────────────────────────────────────────────────
@@ -111,8 +144,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
         ESP_LOGI(TAG, "ACK from %s — ESP-NOW link established!", mac_str);
         entry->paired = true;
 
-        display_show("Sensor Paired!", mac_str);
         display_sensor_list();
+        char name[16];
+        snprintf(name, sizeof(name), "S%d", sensor_index_from_entry(entry) + 1);
+        display_sensor_added_notification(name);
 
         // Clear provisional NVS (may already be empty on reconnect — that's fine)
         nvs_prov_clear();
@@ -127,6 +162,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
             saved_count++;
         }
         nvs_save_sensors(saved_macs, saved_keys, saved_count);
+        ESP_LOGI(TAG, "Sensor %s committed to NVS; total sensors=%d", mac_str, saved_count);
 
     } else if (pkt->type == PKT_EVENT) {
         if (entry == NULL) {
@@ -135,10 +171,17 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
         }
 
         ESP_LOGI(TAG, "Event from %s: %s", mac_str, pkt->payload);
-        char ev_line[96];
-        snprintf(ev_line, sizeof(ev_line), "Sensor Data Incoming: %.60s", pkt->payload);
-        display_show(ev_line, NULL);
-        display_sensor_location(mac_str);
+        if (!entry->enabled || g_mode == MODE_OFFLINE) {
+            ESP_LOGI(TAG, "Dropping event from disabled/offline sensor %s", mac_str);
+            return;
+        }
+
+        parse_sensor_reading(entry, pkt->payload);
+        float temp = 0.0f;
+        float hum = 0.0f;
+        if (espnow_get_first_sensor_reading(&temp, &hum)) {
+            display_update_temp_hum(temp, hum);
+        }
 
         event_item_t item;
         strncpy(item.mac_str, mac_str, sizeof(item.mac_str) - 1);
@@ -148,6 +191,8 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
 
         if (xQueueSend(s_event_queue, &item, 0) != pdTRUE) {
             ESP_LOGW(TAG, "Event queue full — dropping from %s", mac_str);
+        } else {
+            ESP_LOGI(TAG, "Event queued for API forwarding from %s", mac_str);
         }
     }
 }
@@ -187,24 +232,30 @@ static void hello_retry_task(void *arg)
 
     char mac_str[18];
     mac_bytes_to_str(entry->mac, mac_str);
+    ESP_LOGI(TAG, "HELLO retry task started for %s: retries=%d reconnect=%d channel=%d",
+             mac_str, max_retries, is_reconnect, primary);
 
     for (int i = 0; i < max_retries; i++) {
         if (entry->paired) break;
 
         esp_err_t err = esp_now_send(entry->mac, (uint8_t *)&pkt, sizeof(pkt));
-        ESP_LOGI(TAG, "HELLO → %s  attempt %d/%d: %s (ch%d)",
-            mac_str, i + 1, max_retries,
-            err == ESP_OK ? "sent" : esp_err_to_name(err), primary);
+        if (i == 0 || ((i + 1) % 10) == 0 || err != ESP_OK) {
+            ESP_LOGI(TAG, "HELLO to %s attempt %d/%d: %s (ch%d)",
+                     mac_str, i + 1, max_retries,
+                     err == ESP_OK ? "sent" : esp_err_to_name(err), primary);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
     if (!entry->paired) {
         ESP_LOGE(TAG, "No ACK from %s after %d attempts", mac_str, max_retries);
-        display_show("Pair Failed", "No response");
         if (!is_reconnect) {
+            ESP_LOGW(TAG, "Clearing provisional sensor after ACK timeout: %s", mac_str);
             nvs_prov_clear();   // roll back: sensor never confirmed
         }
+    } else {
+        ESP_LOGI(TAG, "HELLO retry task done for %s: paired", mac_str);
     }
 
     vTaskDelete(NULL);
@@ -213,20 +264,41 @@ static void hello_retry_task(void *arg)
 static void start_hello_retry(sensor_entry_t *entry, int max_retries, bool is_reconnect)
 {
     hello_retry_arg_t *arg = malloc(sizeof(hello_retry_arg_t));
-    if (!arg) return;
+    if (!arg) {
+        ESP_LOGE(TAG, "OOM starting HELLO retry task");
+        return;
+    }
     arg->entry        = entry;
     arg->max_retries  = max_retries;
     arg->is_reconnect = is_reconnect;
-    xTaskCreate(hello_retry_task, "hello_retry", 3072, arg, 5, NULL);
+    if (xTaskCreate(hello_retry_task, "hello_retry", 3072, arg, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create HELLO retry task");
+        free(arg);
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
 
 void espnow_init(void)
 {
-    s_event_queue = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(event_item_t));
-    xTaskCreate(event_forward_task, "evt_fwd", 4096, NULL, 4, NULL);
+    if (s_espnow_ready) {
+        ESP_LOGI(TAG, "ESP-NOW already initialized");
+        return;
+    }
 
+    s_event_queue = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(event_item_t));
+    if (!s_event_queue) {
+        ESP_LOGE(TAG, "Failed to create event queue");
+        return;
+    }
+    if (xTaskCreate(event_forward_task, "evt_fwd", 4096, NULL, 4, &s_event_task_handle) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create event forward task");
+        vQueueDelete(s_event_queue);
+        s_event_queue = NULL;
+        return;
+    }
+
+    ESP_LOGI(TAG, "Initializing ESP-NOW stack");
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_set_pmk((const uint8_t *)GLAZIA_ESP_NOW_PMK));
     esp_now_register_recv_cb(espnow_recv_cb);
@@ -234,25 +306,52 @@ void espnow_init(void)
 
     uint8_t primary; wifi_second_chan_t second;
     esp_wifi_get_channel(&primary, &second);
+    s_espnow_ready = true;
     ESP_LOGI(TAG, "ESP-NOW ready — channel: %d, PMK set", primary);
+}
+
+void espnow_deinit(void)
+{
+    if (!s_espnow_ready) return;
+
+    esp_now_unregister_recv_cb();
+    esp_now_unregister_send_cb();
+    esp_err_t err = esp_now_deinit();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_now_deinit failed: %s", esp_err_to_name(err));
+    }
+
+    if (s_event_task_handle) {
+        vTaskDelete(s_event_task_handle);
+        s_event_task_handle = NULL;
+    }
+    if (s_event_queue) {
+        vQueueDelete(s_event_queue);
+        s_event_queue = NULL;
+    }
+
+    memset(s_sensors, 0, sizeof(s_sensors));
+    s_sensor_count = 0;
+    s_espnow_ready = false;
+    ESP_LOGI(TAG, "ESP-NOW stopped");
 }
 
 void espnow_pair_sensor(const char *sensor_mac_str, const char *provision_key_hex)
 {
     if (s_sensor_count >= MAX_SENSORS) {
         ESP_LOGE(TAG, "MAX_SENSORS (%d) reached", MAX_SENSORS);
-        display_show("Pair Failed", "Max sensors!");
         nvs_prov_clear();
         return;
     }
 
     ESP_LOGI(TAG, "Pairing sensor #%d: %s", s_sensor_count + 1, sensor_mac_str);
-    display_show("Sensor Found!", sensor_mac_str);
 
     sensor_entry_t *entry = &s_sensors[s_sensor_count];
     mac_str_to_bytes(sensor_mac_str, entry->mac);
     hex_to_bytes(provision_key_hex, entry->lmk, 16);
     entry->paired = false;
+    entry->enabled = true;
+    entry->has_reading = false;
     s_sensor_count++;
 
     if (!esp_now_is_peer_exist(entry->mac)) {
@@ -262,12 +361,16 @@ void espnow_pair_sensor(const char *sensor_mac_str, const char *provision_key_he
         peer.encrypt = true;
         memcpy(peer.lmk, entry->lmk, 16);
 
-        if (esp_now_add_peer(&peer) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to add encrypted peer %s", sensor_mac_str);
+        esp_err_t err = esp_now_add_peer(&peer);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to add encrypted peer %s: %s", sensor_mac_str, esp_err_to_name(err));
             s_sensor_count--;
             nvs_prov_clear();
             return;
         }
+        ESP_LOGI(TAG, "Encrypted ESP-NOW peer added: %s", sensor_mac_str);
+    } else {
+        ESP_LOGI(TAG, "ESP-NOW peer already exists: %s", sensor_mac_str);
     }
 
     start_hello_retry(entry, 300, false);
@@ -285,7 +388,7 @@ void espnow_get_sensor_list_str(char *out, size_t out_len)
         int n = snprintf(out + pos, out_len - pos,
                          "S%d|Unknown|%s%s",
                          i + 1,
-                         s_sensors[i].paired ? "ON" : "OFF",
+                         s_sensors[i].enabled ? "ON" : "OFF",
                          sep);
         if (n < 0 || (size_t)n >= out_len - pos) break;
         pos += (size_t)n;
@@ -317,6 +420,8 @@ void espnow_reconnect_saved_sensors(void)
         mac_str_to_bytes(macs[i], entry->mac);
         memcpy(entry->lmk, keys[i], 16);
         entry->paired = false;   // will be set true on ACK
+        entry->enabled = nvs_load_sensor_enabled(i, true);
+        entry->has_reading = false;
         s_sensor_count++;
 
         if (!esp_now_is_peer_exist(entry->mac)) {
@@ -326,11 +431,15 @@ void espnow_reconnect_saved_sensors(void)
             peer.encrypt = true;
             memcpy(peer.lmk, entry->lmk, 16);
 
-            if (esp_now_add_peer(&peer) != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to re-add peer %s", macs[i]);
+            esp_err_t err = esp_now_add_peer(&peer);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to re-add peer %s: %s", macs[i], esp_err_to_name(err));
                 s_sensor_count--;
                 continue;
             }
+            ESP_LOGI(TAG, "Encrypted ESP-NOW peer restored: %s", macs[i]);
+        } else {
+            ESP_LOGI(TAG, "Saved ESP-NOW peer already exists: %s", macs[i]);
         }
 
         // Send HELLO to re-establish the encrypted channel after reboot.
@@ -343,4 +452,40 @@ void espnow_reconnect_saved_sensors(void)
 
     // Push initial sensor list to display (all OFF until ACK received)
     display_sensor_list();
+}
+
+int espnow_get_sensor_count(void)
+{
+    return s_sensor_count;
+}
+
+bool espnow_get_sensor_info(int index, char *out_name, size_t out_name_len, bool *out_enabled, bool *out_paired)
+{
+    if (index < 0 || index >= s_sensor_count) return false;
+    if (out_name && out_name_len > 0) {
+        snprintf(out_name, out_name_len, "S%d", index + 1);
+    }
+    if (out_enabled) *out_enabled = s_sensors[index].enabled;
+    if (out_paired) *out_paired = s_sensors[index].paired;
+    return true;
+}
+
+void espnow_set_sensor_enabled(int index, bool enabled)
+{
+    if (index < 0 || index >= s_sensor_count) return;
+    s_sensors[index].enabled = enabled;
+    nvs_save_sensor_enabled(index, enabled);
+    ESP_LOGI(TAG, "Sensor S%d %s", index + 1, enabled ? "enabled" : "disabled");
+}
+
+bool espnow_get_first_sensor_reading(float *out_temp, float *out_hum)
+{
+    for (int i = 0; i < s_sensor_count; i++) {
+        if (s_sensors[i].enabled && s_sensors[i].has_reading) {
+            if (out_temp) *out_temp = s_sensors[i].temp;
+            if (out_hum) *out_hum = s_sensors[i].hum;
+            return true;
+        }
+    }
+    return false;
 }

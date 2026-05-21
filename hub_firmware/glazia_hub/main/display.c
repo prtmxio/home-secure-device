@@ -13,7 +13,12 @@
  *   [3]  Sensor list  — scrollable paired-sensor table     y: 192–311
  */
 #include "display.h"
+#include "button.h"
 #include "espnow.h"
+#include "fingerprint.h"
+#include "wifi.h"
+#include "ui/ui.h"
+#include "ui/screens.h"
 #include "misc/lv_area.h"
 #include "state.h"
 #include "freertos/FreeRTOS.h"
@@ -34,8 +39,6 @@
 
 static const char *TAG = "DISPLAY";
 
-extern const lv_img_dsc_t img_glazia_logo;
-
 /* ── Display constants ───────────────────────────────────────────────────── */
 #define LCD_H_RES          240
 #define LCD_V_RES          320
@@ -46,10 +49,19 @@ extern const lv_img_dsc_t img_glazia_logo;
 #define DRAW_BUF_LINES     50
 
 /* ── LVGL object handles (set once in display_init, read-only after) ─────── */
-static lv_obj_t *s_status_label   = NULL;
-static lv_obj_t *s_location_label = NULL;
-static lv_obj_t *s_sensor_label   = NULL;
 static lv_obj_t *s_critical_sw    = NULL;
+static TaskHandle_t s_auth_task   = NULL;
+static bool s_switch_internal     = false;
+static bool s_ui_online           = true;
+static enum ScreensEnum s_prev_screen = SCREEN_ID_HUB_ONLINE;
+static enum ScreensEnum s_current_screen = SCREEN_ID_HUB_ONLINE;
+static bool s_screen_configured[_SCREEN_ID_LAST + 1];
+
+void display_fingerprint_status(const char *message);
+static void create_sensor_row(lv_obj_t *parent, int index, const char *name, bool enabled);
+static void load_screen_locked(enum ScreensEnum screen);
+static void configure_screen_locked(enum ScreensEnum screen);
+static void refresh_sensor_nodes_locked(void);
 
 /* ── XPT2046 touch — raw SPI device (no registry component needed) ───────── */
 static spi_device_handle_t s_tp_spi = NULL;
@@ -225,21 +237,149 @@ static void xpt2046_read_cb(lv_indev_drv_t *drv,
         : LV_INDEV_STATE_RELEASED;
 }
 
-/*
- * Critical toggle event callback — fires on LV_EVENT_VALUE_CHANGED.
- * Currently just logs toggle state. No fingerprint verification for now.
- */
+typedef struct {
+    lv_obj_t *sw;
+    bool turn_on;
+    int action;
+} auth_task_arg_t;
+
+enum {
+    AUTH_ACTION_HUB_TOGGLE = 1,
+    AUTH_ACTION_ADD_SENSOR,
+    AUTH_ACTION_ADD_FINGERPRINT,
+};
+
+static void set_switch_checked(lv_obj_t *sw, bool checked)
+{
+    if (!sw) return;
+    if (!lvgl_port_lock(pdMS_TO_TICKS(200))) return;
+
+    s_switch_internal = true;
+    if (checked) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    } else {
+        lv_obj_clear_state(sw, LV_STATE_CHECKED);
+    }
+    s_switch_internal = false;
+
+    lvgl_port_unlock();
+}
+
+static void auth_toggle_task(void *arg)
+{
+    auth_task_arg_t *a = (auth_task_arg_t *)arg;
+    lv_obj_t *sw = a->sw;
+    bool turn_on = a->turn_on;
+    int action = a->action;
+    free(a);
+
+    g_mode = MODE_FINGERPRINT_VERIFY;
+    display_show_fingerprint_screen("Verify Fingerprint", "Scan your fingerprint");
+    esp_err_t result = fp_verify();
+
+    if (result == ESP_OK) {
+        if (action == AUTH_ACTION_ADD_SENSOR) {
+            display_clear_sensor_notifications();
+            s_prev_screen = SCREEN_ID_SENSOR_NODES_SETTING;
+            if (lvgl_port_lock(pdMS_TO_TICKS(500))) {
+                load_screen_locked(SCREEN_ID_ADD_ANOTHER__SENSOR);
+                lvgl_port_unlock();
+            }
+            g_mode = MODE_OPERATIONAL;
+        } else if (action == AUTH_ACTION_ADD_FINGERPRINT) {
+            display_show_fingerprint_screen("Add Fingerprint", "Place your finger on the sensor.");
+            g_mode = MODE_FINGERPRINT_ENROLL;
+            if (fp_enroll() == ESP_OK) {
+                display_fingerprint_status("Fingerprint registered");
+            } else {
+                display_fingerprint_status("Enrollment failed");
+            }
+            g_mode = s_ui_online ? MODE_OPERATIONAL : MODE_OFFLINE;
+            vTaskDelay(pdMS_TO_TICKS(1200));
+            display_show_dashboard(s_ui_online);
+        } else if (turn_on) {
+            display_fingerprint_status("Turning hub on");
+            if (wifi_resume_from_offline_mode()) {
+                set_switch_checked(sw, true);
+                display_show_dashboard(true);
+            } else {
+                set_switch_checked(sw, false);
+                g_mode = MODE_OFFLINE;
+                display_show_dashboard(false);
+            }
+        } else {
+            display_fingerprint_status("Turning hub off");
+            wifi_enter_offline_mode();
+            set_switch_checked(sw, false);
+            display_show_dashboard(false);
+        }
+    } else {
+        if (action == AUTH_ACTION_HUB_TOGGLE && turn_on) {
+            set_switch_checked(sw, false);
+            g_mode = MODE_OFFLINE;
+            display_show_dashboard(false);
+        } else if (action == AUTH_ACTION_HUB_TOGGLE) {
+            set_switch_checked(sw, true);
+            g_mode = MODE_OPERATIONAL;
+            display_show_dashboard(true);
+        } else {
+            g_mode = MODE_OPERATIONAL;
+            display_show_dashboard(s_ui_online);
+        }
+        display_fingerprint_status("Access denied");
+    }
+
+    s_auth_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void start_auth_action(int action, lv_obj_t *sw, bool turn_on)
+{
+    if (s_auth_task != NULL) {
+        display_fingerprint_status("Auth in progress");
+        return;
+    }
+
+    auth_task_arg_t *arg = malloc(sizeof(*arg));
+    if (!arg) {
+        display_fingerprint_status("Auth unavailable");
+        return;
+    }
+    arg->sw = sw;
+    arg->turn_on = turn_on;
+    arg->action = action;
+
+    if (xTaskCreate(auth_toggle_task, "fp_auth", 6144, arg, 5, &s_auth_task) != pdPASS) {
+        free(arg);
+        s_auth_task = NULL;
+        display_fingerprint_status("Auth unavailable");
+    }
+}
+
 static void critical_toggle_cb(lv_event_t *e)
 {
-    lv_event_code_t code = lv_event_get_code(e); ESP_LOGI(TAG, "Switch event code=%d", code);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_VALUE_CHANGED || s_switch_internal) return;
+
     lv_obj_t *sw = lv_event_get_target(e);
     bool is_on = lv_obj_has_state(sw, LV_STATE_CHECKED);
 
-    if (is_on) {
-        ESP_LOGI(TAG, "Critical Toggle: ON");
-    } else {
-        ESP_LOGI(TAG, "Critical Toggle: OFF");
+    ESP_LOGI(TAG, "Critical Toggle requested: %s", is_on ? "ON" : "OFF");
+
+    if (s_auth_task != NULL) {
+        set_switch_checked(sw, !is_on);
+        display_fingerprint_status("Auth in progress");
+        return;
     }
+
+    bool can_toggle_on = (g_mode == MODE_OFFLINE && is_on);
+    bool can_toggle_off = (g_mode == MODE_OPERATIONAL && !is_on);
+    if (!can_toggle_on && !can_toggle_off) {
+        set_switch_checked(sw, g_mode != MODE_OFFLINE);
+        return;
+    }
+
+    start_auth_action(AUTH_ACTION_HUB_TOGGLE, sw, is_on);
 }
 
 static void lcd_hw_init(void)
@@ -324,138 +464,220 @@ static void lcd_hw_init(void)
 
 /* ── UI build (called once LVGL task is ready) ───────────────────────────── */
 
-static void build_ui(lv_disp_t *disp)
+static void load_screen_locked(enum ScreensEnum screen)
 {
-    lv_theme_t *theme = lv_theme_default_init(disp,
-        lv_palette_main(LV_PALETTE_RED),
-        lv_palette_main(LV_PALETTE_GREY),
-        true, LV_FONT_DEFAULT);
-    lv_disp_set_theme(disp, theme);
+    ui_ensure_screen(screen);
+    configure_screen_locked(screen);
+    s_current_screen = screen;
+    loadScreen(screen);
+}
 
-    /* Root screen — red background */
-    lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_set_size(scr, LCD_H_RES, LCD_V_RES);
-    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_bg_color(scr, lv_color_make(240, 240, 240), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(scr, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);
+static void set_switch_checked_locked(lv_obj_t *sw, bool checked)
+{
+    if (!sw) return;
+    s_switch_internal = true;
+    if (checked) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    } else {
+        lv_obj_clear_state(sw, LV_STATE_CHECKED);
+    }
+    s_switch_internal = false;
+}
 
-    /* ── Header ──────────────────────────────────────────────────────────── */
-    {
-        /* Logo on the left — 350×350 source, zoomed to ~55px square */
-        lv_obj_t *logo = lv_img_create(scr);
-        lv_img_set_src(logo, &img_glazia_logo);
-        lv_img_set_zoom(logo, 44);
-        lv_img_set_pivot(logo, 0, 0);   /* scale from top-left */
-        lv_obj_align(logo, LV_ALIGN_TOP_LEFT, 10, 6);
+static void set_label_locked(lv_obj_t *label, const char *text)
+{
+    if (label && text) {
+        lv_label_set_text(label, text);
+    }
+}
 
-        /* "GLAZIA / Hub" text on the right — larger size for emphasis */
-        lv_obj_t *t = lv_label_create(scr);
-        lv_obj_set_style_text_font(t, &lv_font_montserrat_26, LV_PART_MAIN);
-        lv_obj_set_style_text_color(t, lv_color_black(), LV_PART_MAIN);
-        lv_label_set_text(t, "GLAZIA");
-        lv_obj_align(t, LV_ALIGN_TOP_MID, 14, 8);
+static void set_dashboard_values_locked(float temp, float hum)
+{
+    char buf[16];
+    if (temp < 0.0f) temp = 0.0f;
+    if (temp > 50.0f) temp = 50.0f;
+    if (hum < 0.0f) hum = 0.0f;
+    if (hum > 100.0f) hum = 100.0f;
 
-        lv_obj_t *s = lv_label_create(scr);
-        lv_obj_set_style_text_font(s, &lv_font_montserrat_14, LV_PART_MAIN);
-        lv_obj_set_style_text_color(s, lv_color_black(), LV_PART_MAIN);
-        lv_label_set_text(s, "Hub");
-        lv_obj_align(s, LV_ALIGN_TOP_MID, 14, 42);
+    snprintf(buf, sizeof(buf), "%.1f", temp);
+    set_label_locked(objects.temp_val, buf);
+    set_label_locked(objects.temp_val_1, buf);
+    if (objects.temp_arc) lv_arc_set_value(objects.temp_arc, (int)temp);
+    if (objects.temp_arc_1) lv_arc_set_value(objects.temp_arc_1, (int)temp);
+
+    snprintf(buf, sizeof(buf), "%.0f", hum);
+    set_label_locked(objects.hum_val, buf);
+    set_label_locked(objects.hum_val_1, buf);
+    if (objects.hum_arc) lv_arc_set_value(objects.hum_arc, (int)hum);
+    if (objects.hum_arc_1) lv_arc_set_value(objects.hum_arc_1, (int)hum);
+}
+
+static void nav_back_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    enum ScreensEnum target = SCREEN_ID_HUB_ONLINE;
+    if (s_current_screen == SCREEN_ID_ABOUT_GLAZIA ||
+        s_current_screen == SCREEN_ID_SENSOR_NODES_SETTING ||
+        s_current_screen == SCREEN_ID_FINGERPRINT_SETTING) {
+        target = SCREEN_ID_SETTINGS_MENU;
+    } else if (s_current_screen == SCREEN_ID_ADD_ANOTHER__SENSOR) {
+        display_clear_sensor_notifications();
+        target = SCREEN_ID_SENSOR_NODES_SETTING;
+    } else {
+        target = s_ui_online ? SCREEN_ID_HUB_ONLINE : SCREEN_ID_HUB_OFFLINE;
     }
 
-    /* ── Status / sensor-data panel ─────────────────────────────────────── */
-    {
-        lv_obj_t *panel = lv_obj_create(scr);
-        lv_obj_set_pos(panel, 8, 68);
-        lv_obj_set_size(panel, 224, 70);
-        lv_obj_set_style_bg_color(panel, lv_color_make(20, 20, 20), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_border_color(panel, lv_color_make(238, 28, 37), LV_PART_MAIN);
-        lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
-        lv_obj_set_style_radius(panel, 6, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(panel, 8, LV_PART_MAIN);
-        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
+        load_screen_locked(target);
+        lvgl_port_unlock();
+    }
+}
 
-        /* Status text — updated by display_show() */
-        s_status_label = lv_label_create(panel);
-        lv_label_set_text(s_status_label, "Starting up...");
-        lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(s_status_label, 208);
-        lv_obj_set_style_text_color(s_status_label, lv_color_white(), LV_PART_MAIN);
-        lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_10, LV_PART_MAIN);
-        lv_obj_align(s_status_label, LV_ALIGN_TOP_LEFT, 0, 0);
+static void settings_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    s_prev_screen = s_ui_online ? SCREEN_ID_HUB_ONLINE : SCREEN_ID_HUB_OFFLINE;
+    if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
+        load_screen_locked(SCREEN_ID_SETTINGS_MENU);
+        lvgl_port_unlock();
+    }
+}
 
-        /* Location / source — updated by display_hub_location() / display_sensor_location() */
-        s_location_label = lv_label_create(panel);
-        lv_label_set_text(s_location_label, "Location: --");
-        lv_label_set_long_mode(s_location_label, LV_LABEL_LONG_DOT);
-        lv_obj_set_width(s_location_label, 208);
-        lv_obj_set_style_text_color(s_location_label, lv_color_make(200, 200, 200), LV_PART_MAIN);
-        lv_obj_set_style_text_font(s_location_label, &lv_font_montserrat_10, LV_PART_MAIN);
-        lv_obj_align(s_location_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+static void sensor_nodes_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (lvgl_port_lock(pdMS_TO_TICKS(500))) {
+        load_screen_locked(SCREEN_ID_SENSOR_NODES_SETTING);
+        refresh_sensor_nodes_locked();
+        lvgl_port_unlock();
+    }
+}
+
+static void about_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
+        load_screen_locked(SCREEN_ID_ABOUT_GLAZIA);
+        lvgl_port_unlock();
+    }
+}
+
+static void add_fingerprint_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    start_auth_action(AUTH_ACTION_ADD_FINGERPRINT, NULL, false);
+}
+
+static void add_sensor_auth_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    start_auth_action(AUTH_ACTION_ADD_SENSOR, NULL, false);
+}
+
+static void add_sensor_start_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    sensor_pairing_open_window();
+}
+
+static void sensor_switch_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED || s_switch_internal) return;
+    lv_obj_t *sw = lv_event_get_target(e);
+    int index = (int)(intptr_t)lv_event_get_user_data(e);
+    bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    espnow_set_sensor_enabled(index, enabled);
+}
+
+static void create_sensor_row(lv_obj_t *parent, int index, const char *name, bool enabled)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_pos(row, 9, 9 + index * 54);
+    lv_obj_set_size(row, 219, 50);
+    lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(row, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, 160, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *label = lv_label_create(row);
+    lv_label_set_text(label, name);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_pos(label, 41, 20);
+
+    lv_obj_t *sw = lv_switch_create(row);
+    lv_obj_set_pos(sw, 165, 15);
+    lv_obj_set_size(sw, 50, 20);
+    set_switch_checked_locked(sw, enabled);
+    lv_obj_add_event_cb(sw, sensor_switch_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)index);
+}
+
+static void configure_screen_locked(enum ScreensEnum screen)
+{
+    if (screen < _SCREEN_ID_FIRST || screen > _SCREEN_ID_LAST || s_screen_configured[screen]) {
+        return;
     }
 
-    /* ── Critical toggle (always ON while hub is powered) ────────────────── */
-    {
-        s_critical_sw = lv_switch_create(scr);
-        lv_obj_set_size(s_critical_sw, 52, 26);
-        lv_obj_align(s_critical_sw, LV_ALIGN_TOP_MID, 0, 144);
-        lv_obj_set_ext_click_area(s_critical_sw, 40);  /* extend hitbox 40px in all directions */
-        lv_obj_add_flag(
-            s_critical_sw,
-            LV_OBJ_FLAG_PRESS_LOCK
-        );
+    switch (screen) {
+    case SCREEN_ID_HUB_ONLINE:
+        s_critical_sw = objects.obj1;
+        if (objects.obj1) lv_obj_add_event_cb(objects.obj1, critical_toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        if (objects.button) lv_obj_add_event_cb(objects.button, settings_cb, LV_EVENT_CLICKED, NULL);
+        set_dashboard_values_locked(0.0f, 0.0f);
+        break;
 
-        lv_obj_add_state(
-            s_critical_sw,
-            LV_STATE_CHECKED
-        );
-        lv_obj_add_event_cb(s_critical_sw, critical_toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
-        lv_obj_add_event_cb(s_critical_sw, critical_toggle_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_set_style_bg_color(s_critical_sw, lv_color_make(238, 28, 37),
-                                   LV_PART_INDICATOR | LV_STATE_CHECKED);
-        lv_obj_set_style_bg_opa(s_critical_sw, LV_OPA_COVER,
-                                  LV_PART_INDICATOR | LV_STATE_CHECKED);
-        lv_obj_set_style_bg_color(s_critical_sw, lv_color_white(),
-                                   LV_PART_KNOB | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_opa(s_critical_sw, LV_OPA_COVER,
-                                  LV_PART_KNOB | LV_STATE_DEFAULT);
+    case SCREEN_ID_HUB_OFFLINE:
+        if (objects.obj22) lv_obj_add_event_cb(objects.obj22, critical_toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        if (objects.button_1) lv_obj_add_event_cb(objects.button_1, settings_cb, LV_EVENT_CLICKED, NULL);
+        break;
 
-        lv_obj_t *lbl = lv_label_create(scr);
-        lv_label_set_text(lbl, "Critical Toggle");
-        lv_obj_set_style_text_color(lbl, lv_color_black(), LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, LV_PART_MAIN);
-        lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 175);
+    case SCREEN_ID_SETTINGS_MENU:
+        if (objects.obj14) lv_obj_add_event_cb(objects.obj14, nav_back_cb, LV_EVENT_CLICKED, NULL);
+        if (objects.fingerprint_option) lv_obj_add_event_cb(objects.fingerprint_option, add_fingerprint_cb, LV_EVENT_CLICKED, NULL);
+        if (objects.sensor_nodes_option) lv_obj_add_event_cb(objects.sensor_nodes_option, sensor_nodes_cb, LV_EVENT_CLICKED, NULL);
+        if (objects.about_section) lv_obj_add_event_cb(objects.about_section, about_cb, LV_EVENT_CLICKED, NULL);
+        break;
+
+    case SCREEN_ID_SENSOR_NODES_SETTING:
+        if (objects.settings_menu_cont_1) {
+            lv_obj_set_scroll_dir(objects.settings_menu_cont_1, LV_DIR_VER);
+            lv_obj_set_scrollbar_mode(objects.settings_menu_cont_1, LV_SCROLLBAR_MODE_ACTIVE);
+        }
+        if (objects.obj44) lv_obj_add_event_cb(objects.obj44, nav_back_cb, LV_EVENT_CLICKED, NULL);
+        if (objects.add_sensor_button) lv_obj_add_event_cb(objects.add_sensor_button, add_sensor_auth_cb, LV_EVENT_CLICKED, NULL);
+        break;
+
+    case SCREEN_ID_ABOUT_GLAZIA: {
+        lv_obj_t *about_parent = objects.obj48 ? lv_obj_get_parent(objects.obj48) : NULL;
+        if (about_parent) {
+            lv_obj_set_scroll_dir(about_parent, LV_DIR_VER);
+            lv_obj_set_scrollbar_mode(about_parent, LV_SCROLLBAR_MODE_ACTIVE);
+        }
+        if (objects.obj47) lv_obj_add_event_cb(objects.obj47, nav_back_cb, LV_EVENT_CLICKED, NULL);
+        break;
     }
 
-    /* ── Sensor list panel — scrollable ──────────────────────────────────── */
-    {
-        lv_obj_t *panel = lv_obj_create(scr);
-        lv_obj_set_pos(panel, 8, 192);
-        lv_obj_set_size(panel, 224, 120);
-        lv_obj_set_style_bg_color(panel, lv_color_make(20, 20, 20), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_border_color(panel, lv_color_make(238, 28, 37), LV_PART_MAIN);
-        lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
-        lv_obj_set_style_radius(panel, 6, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(panel, 8, LV_PART_MAIN);
-        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    case SCREEN_ID_FINGERPRINT_SETTING:
+        if (objects.obj54) lv_obj_add_event_cb(objects.obj54, nav_back_cb, LV_EVENT_CLICKED, NULL);
+        if (objects.obj51) lv_bar_set_value(objects.obj51, 0, LV_ANIM_OFF);
+        break;
 
-        s_sensor_label = lv_label_create(panel);
-        lv_label_set_text(s_sensor_label,
-                          "No sensors paired yet.\nPress hub button to pair.");
-        lv_label_set_long_mode(s_sensor_label, LV_LABEL_LONG_WRAP);
-        lv_label_set_recolor(s_sensor_label, true);
-        lv_obj_set_width(s_sensor_label, 208);
-        lv_obj_set_style_text_color(s_sensor_label,
-                                    lv_color_make(200, 200, 200), LV_PART_MAIN);
-        lv_obj_set_style_text_font(s_sensor_label,
-                                   &lv_font_montserrat_10, LV_PART_MAIN);
-        lv_obj_align(s_sensor_label, LV_ALIGN_TOP_LEFT, 0, 4);
+    case SCREEN_ID_ADD_ANOTHER__SENSOR:
+        if (objects.added_sensor_data) {
+            lv_obj_set_scroll_dir(objects.added_sensor_data, LV_DIR_VER);
+            lv_obj_set_scrollbar_mode(objects.added_sensor_data, LV_SCROLLBAR_MODE_ACTIVE);
+            lv_obj_clean(objects.added_sensor_data);
+        }
+        if (objects.obj55) lv_obj_add_event_cb(objects.obj55, nav_back_cb, LV_EVENT_CLICKED, NULL);
+        if (objects.obj59) lv_obj_add_event_cb(objects.obj59, add_sensor_start_cb, LV_EVENT_CLICKED, NULL);
+        break;
+
+    default:
+        break;
     }
 
-    lv_scr_load(scr);
+    s_screen_configured[screen] = true;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
@@ -469,7 +691,8 @@ void display_init(void)
         ESP_LOGE(TAG, "LVGL lock timed out — display not ready");
         return;
     }
-    build_ui(lv_disp_get_default());
+    ui_init();
+    configure_screen_locked(SCREEN_ID_HUB_ONLINE);
 
     /* Register XPT2046 as LVGL pointer input device inside the lock */
     lv_indev_drv_init(&s_tp_drv);
@@ -480,93 +703,172 @@ void display_init(void)
 
     lvgl_port_unlock();
 
+    fp_set_display_cb(display_fingerprint_status);
+
     ESP_LOGI(TAG, "Display ready — SPI direct, MOSI=GPIO%d, touch enabled", LCD_PIN_MOSI);
 }
 
-/* Thread-safe label update helper */
-static void label_set(lv_obj_t *label, const char *text)
+static void refresh_sensor_nodes_locked(void)
 {
-    if (!label || !text) return;
-    if (!lvgl_port_lock(pdMS_TO_TICKS(100))) return;
-    lv_label_set_text(label, text);
-    lvgl_port_unlock();
+    ui_ensure_screen(SCREEN_ID_SENSOR_NODES_SETTING);
+    configure_screen_locked(SCREEN_ID_SENSOR_NODES_SETTING);
+    if (!objects.settings_menu_cont_1) return;
+
+    lv_obj_clean(objects.settings_menu_cont_1);
+    int count = espnow_get_sensor_count();
+    if (count == 0) {
+        lv_obj_t *label = lv_label_create(objects.settings_menu_cont_1);
+        lv_label_set_text(label, "No sensor added yet");
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_color(label, lv_color_black(), LV_PART_MAIN);
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        char name[24];
+        bool enabled = true;
+        bool paired = false;
+        if (espnow_get_sensor_info(i, name, sizeof(name), &enabled, &paired)) {
+            create_sensor_row(objects.settings_menu_cont_1, i, name, enabled);
+        }
+    }
 }
 
 void display_show(const char *line1, const char *line2)
 {
-    char buf[128];
-    if (line2 && line2[0] != '\0') {
-        snprintf(buf, sizeof(buf), "%s\n%s", line1, line2);
-    } else {
-        snprintf(buf, sizeof(buf), "%s", line1);
+    if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
+        set_label_locked(objects.hub_status, line1);
+        set_label_locked(objects.hub_status_1, line1);
+        set_label_locked(objects.sensor_info, line2 ? line2 : "");
+        set_label_locked(objects.sensor_info_1, line2 ? line2 : "");
+        lvgl_port_unlock();
     }
-    label_set(s_status_label, buf);
     ESP_LOGI(TAG, "Display: [%s] [%s]", line1, line2 ? line2 : "");
+}
+
+void display_show_setup_prompt(void)
+{
+    s_ui_online = false;
+    if (!lvgl_port_lock(pdMS_TO_TICKS(500))) return;
+    load_screen_locked(SCREEN_ID_HUB_OFFLINE);
+    set_switch_checked_locked(objects.obj22, false);
+    set_label_locked(objects.hub_status_1, "Setup");
+    set_label_locked(objects.welcome_home_1, "Glazia Hub");
+    set_label_locked(objects.sensor_info_1, "Press button\nfor BLE setup");
+    lvgl_port_unlock();
+    ESP_LOGI(TAG, "Display setup prompt");
+}
+
+void display_fingerprint_status(const char *message)
+{
+    if (!message) return;
+    if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
+        set_label_locked(objects.obj52, message);
+        lvgl_port_unlock();
+    }
+    ESP_LOGI(TAG, "Fingerprint panel: %s", message);
 }
 
 void display_hub_location(const char *home_name)
 {
     if (!home_name) return;
-    char buf[72];
-    snprintf(buf, sizeof(buf), "Hub: %s", home_name);
-    label_set(s_location_label, buf);
+    if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
+        set_label_locked(objects.sensor_info, home_name);
+        set_label_locked(objects.sensor_info_1, home_name);
+        lvgl_port_unlock();
+    }
 }
 
 void display_sensor_location(const char *mac_str)
 {
-    if (!mac_str) return;
-    char buf[72];
-    snprintf(buf, sizeof(buf), "From: %s", mac_str);
-    label_set(s_location_label, buf);
+    (void)mac_str;
 }
 
 void display_sensor_list(void)
 {
-    if (!s_sensor_label) return;
+    display_refresh_sensor_nodes();
+}
 
-    char sensors[140];
-    espnow_get_sensor_list_str(sensors, sizeof(sensors));
+void display_show_dashboard(bool online)
+{
+    s_ui_online = online;
+    g_mode = online ? MODE_OPERATIONAL : MODE_OFFLINE;
+    if (!lvgl_port_lock(pdMS_TO_TICKS(500))) return;
+    load_screen_locked(online ? SCREEN_ID_HUB_ONLINE : SCREEN_ID_HUB_OFFLINE);
+    set_switch_checked_locked(objects.obj1, true);
+    set_switch_checked_locked(objects.obj22, false);
+    lvgl_port_unlock();
+}
 
-    /* Build "Name : #00FF00 Online#" / "#FF0000 Offline#" per entry */
-    char out[512];
-    int  pos = 0;
-    char buf[150];
-    strncpy(buf, sensors, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
+void display_show_fingerprint_screen(const char *title, const char *prompt)
+{
+    if (!lvgl_port_lock(pdMS_TO_TICKS(500))) return;
+    s_prev_screen = s_current_screen;
+    load_screen_locked(SCREEN_ID_FINGERPRINT_SETTING);
+    set_label_locked(objects.obj53, title ? title : "Fingerprint");
+    set_label_locked(objects.obj49, prompt ? prompt : "Place your finger on the sensor.");
+    set_label_locked(objects.obj52, "Processing . . .");
+    if (objects.obj51) lv_bar_set_value(objects.obj51, 0, LV_ANIM_OFF);
+    lvgl_port_unlock();
+}
 
-    char *entry = buf;
-    int   count = 0;
+void display_fingerprint_progress(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    if (!lvgl_port_lock(pdMS_TO_TICKS(100))) return;
+    if (objects.obj51) lv_bar_set_value(objects.obj51, percent, LV_ANIM_OFF);
+    lvgl_port_unlock();
+}
 
-    while (entry && *entry && pos < (int)sizeof(out) - 1) {
-        char *next   = strchr(entry, ';');
-        if (next) *next++ = '\0';
+void display_update_temp_hum(float temp, float hum)
+{
+    if (!lvgl_port_lock(pdMS_TO_TICKS(200))) return;
+    set_dashboard_values_locked(temp, hum);
+    lvgl_port_unlock();
+}
 
-        char *name   = entry;
-        char *loc    = strchr(name, '|');
-        char *status = NULL;
-        if (loc) {
-            *loc++ = '\0';
-            status = strchr(loc, '|');
-            if (status) *status++ = '\0';
-        }
+void display_refresh_sensor_nodes(void)
+{
+    if (!lvgl_port_lock(pdMS_TO_TICKS(500))) return;
+    refresh_sensor_nodes_locked();
+    lvgl_port_unlock();
+}
 
-        bool online = (status && strcmp(status, "ON") == 0);
-        pos += snprintf(out + pos, sizeof(out) - pos,
-                        "%s : %s\n",
-                        name ? name : "?",
-                        online ? "#00FF00 Online#" : "#FF0000 Offline#");
-        count++;
-        entry = next;
+void display_sensor_added_notification(const char *name)
+{
+    if (!name) return;
+    if (!lvgl_port_lock(pdMS_TO_TICKS(300))) return;
+    ui_ensure_screen(SCREEN_ID_ADD_ANOTHER__SENSOR);
+    configure_screen_locked(SCREEN_ID_ADD_ANOTHER__SENSOR);
+    if (!objects.added_sensor_data) {
+        lvgl_port_unlock();
+        return;
     }
 
-    if (count == 0) {
-        strncpy(out, "No sensors paired.\nPress hub button to pair.",
-                sizeof(out) - 1);
-    } else {
-        int len = (int)strlen(out);
-        if (len > 0 && out[len - 1] == '\n') out[len - 1] = '\0';
-    }
+    int index = lv_obj_get_child_cnt(objects.added_sensor_data);
+    lv_obj_t *row = lv_obj_create(objects.added_sensor_data);
+    lv_obj_set_pos(row, 7, 8 + index * 30);
+    lv_obj_set_size(row, 180, 26);
+    lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(row, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, 120, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-    label_set(s_sensor_label, out);
-    ESP_LOGI(TAG, "Display sensor list: %s", sensors[0] ? sensors : "(empty)");
+    lv_obj_t *label = lv_label_create(row);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%s added", name);
+    lv_label_set_text(label, buf);
+    lv_obj_set_pos(label, 38, 6);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_10, LV_PART_MAIN);
+    lv_obj_set_style_text_color(label, lv_color_black(), LV_PART_MAIN);
+    lvgl_port_unlock();
+}
+
+void display_clear_sensor_notifications(void)
+{
+    if (!lvgl_port_lock(pdMS_TO_TICKS(300))) return;
+    if (objects.added_sensor_data) lv_obj_clean(objects.added_sensor_data);
+    lvgl_port_unlock();
 }
