@@ -7,7 +7,7 @@
  * R307 Fingerprint Sensor Driver
  *
  * Communicates over UART2 at 57600 baud.
- * Wiring: R307 TX -> GPIO43 (ESP RX), R307 RX -> GPIO44 (ESP TX).
+ * Wiring: R307 TX -> GPIO16 (ESP RX), R307 RX -> GPIO15 (ESP TX).
  * Stores one master template in R307's onboard flash (slot 1).
  */
 

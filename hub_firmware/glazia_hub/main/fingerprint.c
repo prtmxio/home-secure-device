@@ -5,8 +5,8 @@
  * which is the verified working ESP-IDF sample for this hardware.
  *
  * Wiring for this prototype:
- *   R307 TX -> ESP32-S3 GPIO43 (UART2 RX)
- *   R307 RX -> ESP32-S3 GPIO44 (UART2 TX)
+ *   R307 TX -> ESP32-S3 GPIO16 (UART2 RX)
+ *   R307 RX -> ESP32-S3 GPIO15 (UART2 TX)
  */
 
 #include "fingerprint.h"
@@ -25,8 +25,8 @@
 static const char *TAG = "FINGERPRINT";
 
 #define R307_UART_NUM UART_NUM_2
-#define R307_TX_PIN 44
-#define R307_RX_PIN 43
+#define R307_TX_PIN 15
+#define R307_RX_PIN 16
 #define R307_BAUD_RATE 57600
 #define R307_RX_BUF_SIZE 256
 #define R307_CMD_TIMEOUT_MS 5000
@@ -363,8 +363,9 @@ static esp_err_t fp_enroll_once(uint16_t slot)
     esp_err_t result = ESP_FAIL;
 
     ESP_LOGI(TAG, "Enrollment target slot: %u", slot);
-    fp_display("Place finger on sensor");
+    display_fingerprint_phase("Registering your fingerprint", "Place your finger on the sensor");
     delay_until_tick_with_progress(start, deadline, scan_start);
+    display_fingerprint_phase("Registering your fingerprint", "Processing...");
 
     if (!r307_capture_to_buffer_until(1, start, deadline)) {
         goto done;
@@ -376,6 +377,7 @@ static esp_err_t fp_enroll_once(uint16_t slot)
         goto done;
     }
     delay_until_tick_with_progress(start, deadline, second_capture_at);
+    display_fingerprint_phase("Registering your fingerprint", "Processing...");
 
     if (!r307_capture_to_buffer_until(2, start, deadline)) {
         goto done;
@@ -405,9 +407,9 @@ done:
     delay_until_tick(deadline);
     display_fingerprint_progress(100);
     if (result == ESP_OK) {
-        fp_display("Fingerprint registered");
+        display_fingerprint_phase("Registering your fingerprint", "Registration completed");
     } else {
-        fp_display("Enrollment failed");
+        display_fingerprint_phase("Registering your fingerprint", "Denied");
     }
     return result;
 }
@@ -453,13 +455,10 @@ static esp_err_t fp_verify_once(int attempt_num)
     const TickType_t deadline = start + pdMS_TO_TICKS(FP_VERIFY_WINDOW_MS);
     esp_err_t result = ESP_FAIL;
 
-    if (attempt_num == 1) {
-        fp_display("Scan your fingerprint");
-    } else {
-        fp_display("Try fingerprint again");
-    }
+    display_fingerprint_phase("Verifying your fingerprint", "Place your finger on the sensor");
 
     delay_until_tick_with_progress(start, deadline, scan_start);
+    display_fingerprint_phase("Verifying your fingerprint", "Processing...");
 
     if (!r307_capture_to_buffer_until(1, start, deadline)) {
         goto done;
@@ -499,9 +498,9 @@ done:
     delay_until_tick(deadline);
     display_fingerprint_progress(100);
     if (result == ESP_OK) {
-        fp_display("Access granted");
+        display_fingerprint_phase("Verifying your fingerprint", "Access granted");
     } else {
-        fp_display("Access denied");
+        display_fingerprint_phase("Verifying your fingerprint", "Denied");
     }
     return result;
 }
@@ -568,7 +567,7 @@ static void fp_enroll_task(void *arg)
 
     ESP_LOGI(TAG, "Fingerprint enrollment task started");
     g_mode = MODE_FINGERPRINT_ENROLL;
-    display_show_fingerprint_screen("Add Fingerprint", "Place your finger on the sensor.");
+    display_show_fingerprint_screen("Add Fingerprint", "Place your finger on the sensor");
 
     esp_err_t err = fp_enroll();
     if (err == ESP_OK) {

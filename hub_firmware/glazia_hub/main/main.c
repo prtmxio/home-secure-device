@@ -20,6 +20,7 @@ char g_pending_sensor_mac[18] = {0};
 char g_pending_provision_key[33] = {0};
 
 void app_main(void) {
+    ESP_LOGI(TAG, "APP CONSOLE: UART0 active");
     ESP_LOGI(TAG, "Boot: app_main starting");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -35,17 +36,24 @@ void app_main(void) {
     snprintf(g_hub_mac, sizeof(g_hub_mac), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     ESP_LOGI(TAG, "HUB MAC: %s", g_hub_mac);
 
+    ESP_LOGI(TAG, "display_init starting");
     display_init();
+    ESP_LOGI(TAG, "display_init queued/done");
+
+    ESP_LOGI(TAG, "fp_init starting");
     esp_err_t fp_err = fp_init();
     if (fp_err != ESP_OK) {
         ESP_LOGW(TAG, "Fingerprint init failed: %s", esp_err_to_name(fp_err));
     } else {
         ESP_LOGI(TAG, "Fingerprint driver ready");
     }
+
+    ESP_LOGI(TAG, "button_init starting");
     button_init();
     ESP_LOGI(TAG, "Button input ready");
 
     // AUTO-CONNECT LOGIC
+    ESP_LOGI(TAG, "Credential check starting");
     if (nvs_load_credentials()) {
         ESP_LOGI(TAG, "Saved credentials found! Reconnecting...");
         g_mode = MODE_WIFI_CONNECTING;

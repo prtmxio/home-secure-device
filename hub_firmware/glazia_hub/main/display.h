@@ -30,6 +30,7 @@ void display_sensor_location(const char *mac_str);
 // Generated UI navigation/update helpers.
 void display_show_dashboard(bool online);
 void display_show_fingerprint_screen(const char *title, const char *prompt);
+void display_fingerprint_phase(const char *phase, const char *message);
 void display_fingerprint_progress(uint8_t percent);
 void display_update_temp_hum(float temp, float hum);
 void display_refresh_sensor_nodes(void);
