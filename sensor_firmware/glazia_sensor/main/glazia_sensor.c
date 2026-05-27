@@ -8,8 +8,8 @@
  *   3. Save to provisional NVS "glz_prov", stop BLE
  *   4. Init WiFi → ESP-NOW (set PMK), add hub as encrypted peer (LMK =
  * provision_key)
- *   5. Channel-scan and wait up to 60s for HELLO from hub
- *   6. HELLO → lock channel, send ACK, promote "glz_prov" → "glz_main"
+ *   5. Channel-scan and wait for HELLO from hub
+ *   6. HELLO → validate MACs, send nonce ACK, wait for COMMIT, promote NVS
  *   7. Start periodic sensor event loop
  *
  * On reboot with "glz_main" NVS:
@@ -34,12 +34,14 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_now.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,7 +64,7 @@ static const char *TAG = "SENSOR";
 #define BUTTON_GPIO 6
 #define DHT_PIN GPIO_NUM_4
 #define BLE_ADV_TIMEOUT_MS (60 * 1000)
-#define HELLO_PROV_TIMEOUT_MS (10 * 60 * 1000)
+#define HELLO_PROV_TIMEOUT_MS (2 * 60 * 1000)
 #define NVS_MAIN_NS "glz_main"
 #define NVS_PROV_NS "glz_prov"
 // PMK must match hub firmware's GLAZIA_ESP_NOW_PMK (exactly 16 bytes)
@@ -71,6 +73,7 @@ static const char *TAG = "SENSOR";
 #define PKT_HELLO 0x01
 #define PKT_ACK 0x02
 #define PKT_EVENT 0x03
+#define PKT_COMMIT 0x04
 
 typedef struct {
   uint8_t type;
@@ -84,6 +87,25 @@ static uint8_t s_hub_mac_bytes[6] = {0};
 static uint8_t s_lmk[16] = {0};
 static volatile bool s_hub_paired = false;
 static volatile bool s_scan_stop = false;
+static char s_pair_nonce[17] = {0};
+static TaskHandle_t s_ack_task_handle = NULL;
+
+typedef enum {
+  PAIR_WAITING_HELLO = 0,
+  PAIR_WAITING_COMMIT,
+  PAIR_COMPLETE,
+} pairing_state_t;
+
+static volatile pairing_state_t s_pair_state = PAIR_WAITING_HELLO;
+
+typedef struct {
+  char hub_mac[18];
+  char sensor_mac[18];
+  char nonce[17];
+  uint8_t hub_channel;
+} pending_ack_t;
+
+static pending_ack_t s_pending_ack = {0};
 
 /* ── BLE state ──────────────────────────────────────────────────────────────
  */
@@ -107,6 +129,75 @@ static void hex_to_bytes(const char *hex, uint8_t *out, int len) {
 static void mac_str_to_bytes(const char *s, uint8_t *b) {
   sscanf(s, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &b[0], &b[1], &b[2], &b[3], &b[4],
          &b[5]);
+}
+
+static void mac_bytes_to_str(const uint8_t *mac, char *out) {
+  snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2],
+           mac[3], mac[4], mac[5]);
+}
+
+static void normalize_mac_string(char *mac) {
+  if (!mac) {
+    return;
+  }
+  for (size_t i = 0; mac[i] != '\0'; i++) {
+    mac[i] = (char)toupper((unsigned char)mac[i]);
+  }
+}
+
+static void log_sensor_identity(const char *context) {
+  ESP_LOGI(TAG, "===========================================");
+  ESP_LOGI(TAG, "%s", context ? context : "Sensor identity");
+  ESP_LOGI(TAG, " Sensor MAC: %s", s_own_mac_str);
+  ESP_LOGI(TAG, " Use this MAC in Postman pair_sensor");
+  ESP_LOGI(TAG, " BLE name: GlaziaSensor");
+  ESP_LOGI(TAG, "===========================================");
+}
+
+static const char *pair_state_str(pairing_state_t state) {
+  switch (state) {
+  case PAIR_WAITING_HELLO:
+    return "WAITING_HELLO";
+  case PAIR_WAITING_COMMIT:
+    return "WAITING_COMMIT";
+  case PAIR_COMPLETE:
+    return "COMPLETE";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+static bool parse_pair_payload(const char *payload, char *hub_mac,
+                               size_t hub_mac_len, char *sensor_mac,
+                               size_t sensor_mac_len, char *nonce,
+                               size_t nonce_len, int *channel) {
+  char parsed_hub[18] = {0};
+  char parsed_sensor[18] = {0};
+  char parsed_nonce[17] = {0};
+  int parsed_channel = 0;
+  int matched = sscanf(payload, "H:%17[^;];S:%17[^;];N:%16[^;];C:%d",
+                       parsed_hub, parsed_sensor, parsed_nonce,
+                       &parsed_channel);
+  if (matched < 3 || strlen(parsed_hub) != 17 ||
+      strlen(parsed_sensor) != 17 || strlen(parsed_nonce) != 16) {
+    return false;
+  }
+  if (hub_mac && hub_mac_len > 0) {
+    strncpy(hub_mac, parsed_hub, hub_mac_len - 1);
+    hub_mac[hub_mac_len - 1] = '\0';
+  }
+  if (sensor_mac && sensor_mac_len > 0) {
+    strncpy(sensor_mac, parsed_sensor, sensor_mac_len - 1);
+    sensor_mac[sensor_mac_len - 1] = '\0';
+  }
+  if (nonce && nonce_len > 0) {
+    strncpy(nonce, parsed_nonce, nonce_len - 1);
+    nonce[nonce_len - 1] = '\0';
+  }
+  if (channel) {
+    *channel = (matched == 4) ? parsed_channel : 0;
+  }
+  return true;
 }
 
 static int wait_for_level(int level, uint32_t timeout_us) {
@@ -223,8 +314,67 @@ static void wifi_init_for_espnow(void) {
 
 /* ── ESP-NOW ────────────────────────────────────────────────────────────────
  */
-static void espnow_send_cb(const uint8_t *mac, esp_now_send_status_t status) {
+static void espnow_send_cb(const esp_now_send_info_t *tx_info,
+                           esp_now_send_status_t status) {
+  const uint8_t *dest = tx_info ? tx_info->des_addr : NULL;
+  char mac_str[18] = {0};
+  if (dest && memcmp(dest, s_hub_mac_bytes, 6) == 0 &&
+      s_pair_state == PAIR_WAITING_COMMIT) {
+    mac_bytes_to_str(dest, mac_str);
+    ESP_LOGI(TAG, "Pairing send callback to %s: %s", mac_str,
+             status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+    return;
+  }
+
   ESP_LOGD(TAG, "Send %s", status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+}
+
+static void ack_send_task(void *arg) {
+  while (1) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    pending_ack_t pending = s_pending_ack;
+    espnow_packet_t ack = {.type = PKT_ACK};
+    uint8_t current_channel = 0;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    snprintf(ack.payload, sizeof(ack.payload), "H:%s;S:%s;N:%s",
+             pending.hub_mac, pending.sensor_mac, pending.nonce);
+
+    esp_wifi_get_channel(&current_channel, &second);
+    uint8_t target_channel =
+        pending.hub_channel > 0 ? pending.hub_channel : current_channel;
+    ESP_LOGI(TAG, "ACK task: locking to ch%d for nonce %s",
+             target_channel, pending.nonce);
+
+    vTaskDelay(pdMS_TO_TICKS(450));
+
+    esp_err_t chan_err =
+        esp_wifi_set_channel(target_channel, WIFI_SECOND_CHAN_NONE);
+    if (chan_err != ESP_OK) {
+      ESP_LOGW(TAG, "ACK task: esp_wifi_set_channel(%u) failed: %s",
+               target_channel, esp_err_to_name(chan_err));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    for (int attempt = 1; attempt <= 4; attempt++) {
+      esp_err_t err =
+          esp_now_send(s_hub_mac_bytes, (uint8_t *)&ack, sizeof(ack));
+      if (err == ESP_OK) {
+        ESP_LOGI(TAG, "ACK attempt %d/4 queued", attempt);
+      } else {
+        ESP_LOGW(TAG, "ACK attempt %d/4 failed to queue: %s", attempt,
+                 esp_err_to_name(err));
+      }
+
+      if (s_pair_state != PAIR_WAITING_COMMIT) {
+        ESP_LOGI(TAG, "ACK burst stopped early, pairing state=%s",
+                 pair_state_str(s_pair_state));
+        break;
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(120));
+    }
+  }
 }
 
 static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
@@ -234,22 +384,78 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
   const espnow_packet_t *pkt = (const espnow_packet_t *)data;
 
   if (pkt->type == PKT_HELLO) {
-    // Always respond to HELLO — handles both initial pairing and hub
-    // reboot/reconnect. If s_hub_paired is already true, the ACK re-establishes
-    // the link on the hub side.
+    char src_mac[18] = {0};
+    char hello_hub[18] = {0};
+    char hello_sensor[18] = {0};
+    char hello_nonce[17] = {0};
     int hub_ch = 0;
-    if (sscanf(pkt->payload, "HELLO_FROM_HUB:ch=%d", &hub_ch) == 1 &&
-        hub_ch > 0) {
-      esp_wifi_set_channel(hub_ch, WIFI_SECOND_CHAN_NONE);
-      ESP_LOGI(TAG, "HELLO received on ch%d — sending ACK", hub_ch);
-    } else {
-      ESP_LOGI(TAG, "HELLO received — sending ACK");
+    mac_bytes_to_str(info->src_addr, src_mac);
+
+    if (!parse_pair_payload(pkt->payload, hello_hub, sizeof(hello_hub),
+                            hello_sensor, sizeof(hello_sensor), hello_nonce,
+                            sizeof(hello_nonce), &hub_ch)) {
+      ESP_LOGW(TAG, "Malformed HELLO from %s", src_mac);
+      return;
+    }
+    if (strcmp(src_mac, hello_hub) != 0 ||
+        strcmp(hello_hub, s_ble_hub_mac) != 0 ||
+        strcmp(hello_sensor, s_own_mac_str) != 0) {
+      ESP_LOGW(TAG, "HELLO proof mismatch src=%s hub=%s sensor=%s", src_mac,
+               hello_hub, hello_sensor);
+      return;
     }
 
-    espnow_packet_t ack = {.type = PKT_ACK};
-    snprintf(ack.payload, sizeof(ack.payload), "ACK_FROM_%s", s_own_mac_str);
-    esp_now_send(s_hub_mac_bytes, (uint8_t *)&ack, sizeof(ack));
+    if (s_pair_state != PAIR_WAITING_HELLO) {
+      if (strcmp(hello_nonce, s_pair_nonce) == 0) {
+        ESP_LOGI(TAG, "Duplicate HELLO ignored for nonce %s while %s",
+                 hello_nonce, pair_state_str(s_pair_state));
+      } else {
+        ESP_LOGW(TAG, "Unexpected HELLO nonce=%s while %s", hello_nonce,
+                 pair_state_str(s_pair_state));
+      }
+      return;
+    }
 
+    ESP_LOGI(TAG, "HELLO validated from %s for sensor %s nonce=%s ch=%d",
+             hello_hub, hello_sensor, hello_nonce, hub_ch);
+    strncpy(s_pair_nonce, hello_nonce, sizeof(s_pair_nonce) - 1);
+    s_pair_nonce[sizeof(s_pair_nonce) - 1] = '\0';
+    s_scan_stop = true;
+    s_pair_state = PAIR_WAITING_COMMIT;
+    strncpy(s_pending_ack.hub_mac, s_ble_hub_mac, sizeof(s_pending_ack.hub_mac) - 1);
+    strncpy(s_pending_ack.sensor_mac, s_own_mac_str, sizeof(s_pending_ack.sensor_mac) - 1);
+    strncpy(s_pending_ack.nonce, s_pair_nonce, sizeof(s_pending_ack.nonce) - 1);
+    s_pending_ack.hub_mac[sizeof(s_pending_ack.hub_mac) - 1] = '\0';
+    s_pending_ack.sensor_mac[sizeof(s_pending_ack.sensor_mac) - 1] = '\0';
+    s_pending_ack.nonce[sizeof(s_pending_ack.nonce) - 1] = '\0';
+    s_pending_ack.hub_channel = hub_ch > 0 ? (uint8_t)hub_ch : 0;
+    ESP_LOGI(TAG, "HELLO accepted — stopping scan and scheduling ACK");
+    if (s_ack_task_handle) {
+      xTaskNotifyGive(s_ack_task_handle);
+    }
+  } else if (pkt->type == PKT_COMMIT) {
+    char src_mac[18] = {0};
+    char commit_hub[18] = {0};
+    char commit_sensor[18] = {0};
+    char commit_nonce[17] = {0};
+    mac_bytes_to_str(info->src_addr, src_mac);
+
+    if (!parse_pair_payload(pkt->payload, commit_hub, sizeof(commit_hub),
+                            commit_sensor, sizeof(commit_sensor),
+                            commit_nonce, sizeof(commit_nonce), NULL)) {
+      ESP_LOGW(TAG, "Malformed COMMIT from %s", src_mac);
+      return;
+    }
+    if (strcmp(src_mac, commit_hub) != 0 ||
+        strcmp(commit_hub, s_ble_hub_mac) != 0 ||
+        strcmp(commit_sensor, s_own_mac_str) != 0 ||
+        strcmp(commit_nonce, s_pair_nonce) != 0) {
+      ESP_LOGW(TAG, "COMMIT proof mismatch from %s", src_mac);
+      return;
+    }
+
+    ESP_LOGI(TAG, "COMMIT validated — ESP-NOW pairing confirmed");
+    s_pair_state = PAIR_COMPLETE;
     s_hub_paired = true;
     s_scan_stop = true;
   }
@@ -260,6 +466,18 @@ static void espnow_init_and_add_hub(void) {
   ESP_ERROR_CHECK(esp_now_set_pmk((const uint8_t *)GLAZIA_ESP_NOW_PMK));
   esp_now_register_send_cb(espnow_send_cb);
   esp_now_register_recv_cb(espnow_recv_cb);
+  s_pair_state = PAIR_WAITING_HELLO;
+  memset(s_pair_nonce, 0, sizeof(s_pair_nonce));
+  memset(&s_pending_ack, 0, sizeof(s_pending_ack));
+
+  if (!s_ack_task_handle) {
+    BaseType_t ok = xTaskCreate(ack_send_task, "ack_send", 3072, NULL, 5,
+                                &s_ack_task_handle);
+    if (ok != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create ACK send task");
+      abort();
+    }
+  }
 
   // Add hub as encrypted peer — must be done BEFORE HELLO arrives
   if (!esp_now_is_peer_exist(s_hub_mac_bytes)) {
@@ -282,6 +500,7 @@ static void channel_scan_task(void *arg) {
     ch = (ch % 13) + 1;
     vTaskDelay(pdMS_TO_TICKS(400));
   }
+  ESP_LOGI(TAG, "Channel scan task stopping");
   vTaskDelete(NULL);
 }
 
@@ -326,6 +545,7 @@ static int gatt_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     uint16_t n = data_len < 17 ? data_len : 17;
     os_mbuf_copydata(ctxt->om, 0, n, s_ble_hub_mac);
     s_ble_hub_mac[n] = '\0';
+    normalize_mac_string(s_ble_hub_mac);
     ESP_LOGI(TAG, "BLE: hub_mac = %s", s_ble_hub_mac);
   } else if (uuid16 == 0xFF11) {
     uint16_t n = data_len < 32 ? data_len : 32;
@@ -450,6 +670,7 @@ void app_main(void) {
     ret = nvs_flash_init();
   }
   ESP_ERROR_CHECK(ret);
+  ESP_LOGI(TAG, "Reset reason: %d", esp_reset_reason());
 
   // Own MAC
   uint8_t own_mac[6];
@@ -458,10 +679,7 @@ void app_main(void) {
            "%02X:%02X:%02X:%02X:%02X:%02X", own_mac[0], own_mac[1], own_mac[2],
            own_mac[3], own_mac[4], own_mac[5]);
 
-  ESP_LOGI(TAG, "===========================================");
-  ESP_LOGI(TAG, " Glazia Sensor  MAC: %s", s_own_mac_str);
-  ESP_LOGI(TAG, " (use this MAC when pairing via the app)");
-  ESP_LOGI(TAG, "===========================================");
+  log_sensor_identity("Glazia sensor boot");
 
   // Button GPIO (active-low, internal pull-up)
   gpio_config_t io = {
@@ -511,11 +729,15 @@ void app_main(void) {
 
     strncpy(hub_mac_str, s_ble_hub_mac, sizeof(hub_mac_str) - 1);
     strncpy(prov_key_hex, s_ble_prov_key, sizeof(prov_key_hex) - 1);
+    normalize_mac_string(hub_mac_str);
     nvs_save_pair(NVS_PROV_NS, hub_mac_str, prov_key_hex);
     has_prov = true;
   }
 
   // ── Convert credentials ───────────────────────────────────────────────
+  normalize_mac_string(hub_mac_str);
+  strncpy(s_ble_hub_mac, hub_mac_str, sizeof(s_ble_hub_mac) - 1);
+  s_ble_hub_mac[sizeof(s_ble_hub_mac) - 1] = '\0';
   mac_str_to_bytes(hub_mac_str, s_hub_mac_bytes);
   hex_to_bytes(prov_key_hex, s_lmk, 16);
   ESP_LOGI(TAG, "Hub MAC: %s  LMK: loaded", hub_mac_str);
@@ -532,8 +754,8 @@ void app_main(void) {
     // event_task will skip sends until s_hub_paired=true (set in recv_cb)
 
   } else {
-    // Provisional — must receive HELLO within 60s or roll back
-    ESP_LOGI(TAG, "Provisional — waiting up to 60s for HELLO from hub");
+    // Provisional — must receive COMMIT within the local pairing timeout.
+    ESP_LOGI(TAG, "Provisional — waiting up to %d ms for COMMIT from hub", HELLO_PROV_TIMEOUT_MS);
     xTaskCreate(channel_scan_task, "ch_scan", 2048, NULL, 4, NULL);
 
     int waited = 0;
@@ -545,14 +767,15 @@ void app_main(void) {
     s_scan_stop = true;
 
     if (s_hub_paired) {
-      // ✓ ACK sent in recv_cb — now promote prov → main
+      // COMMIT received — promote provisional credentials to main storage.
       nvs_save_pair(NVS_MAIN_NS, hub_mac_str, prov_key_hex);
       nvs_erase_ns(NVS_PROV_NS);
       ESP_LOGI(TAG, "Pairing confirmed — promoted to main NVS");
       xTaskCreate(event_task, "events", 3072, NULL, 5, NULL);
     } else {
       // Hub never responded — roll back
-      ESP_LOGE(TAG, "HELLO timeout — clearing provisional NVS and restarting");
+      ESP_LOGE(TAG, "Pairing timeout in state %s — clearing provisional NVS and restarting",
+               pair_state_str(s_pair_state));
       nvs_erase_ns(NVS_PROV_NS);
       vTaskDelay(pdMS_TO_TICKS(1000));
       esp_restart();

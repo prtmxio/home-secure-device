@@ -21,6 +21,7 @@ static const char *TAG = "BUTTON";
 
 static TimerHandle_t s_pair_timer = NULL;
 static TaskHandle_t  s_poll_task  = NULL;
+static bool          s_pair_sensor_claimed = false;
 
 static void start_hub_pairing(void)
 {
@@ -41,27 +42,26 @@ static void pairing_timeout_cb(TimerHandle_t xTimer)
     }
 }
 
-// Polls GET /api/device/hubs/pending-sensor every 3 s while the 2-minute window
-// is open. Each time a sensor is returned it immediately kicks off ESP-NOW pairing
-// and keeps polling for more — supports batch pairing of multiple sensors.
+// Polls GET /api/device/hubs/pending-sensor every 3 s until one sensor is
+// claimed. The remaining pairing window is reserved for the ESP-NOW handshake.
 static void sensor_poll_task(void *arg)
 {
     char sensor_mac[18]    = {0};
     char provision_key[33] = {0};
+    char sensor_name[32]   = {0};
+    char sensor_zone[32]   = {0};
     ESP_LOGI(TAG, "Sensor pairing poll task started: interval=%d ms timeout=%d ms",
              SENSOR_POLL_INTERVAL_MS, SENSOR_PAIR_TIMEOUT_MS);
 
-    while (g_mode == MODE_SENSOR_PAIRING) {
-        if (api_fetch_sensor_pairing(sensor_mac, provision_key)) {
+    while (g_mode == MODE_SENSOR_PAIRING && !s_pair_sensor_claimed) {
+        if (api_fetch_sensor_pairing(sensor_mac, provision_key,
+                                     sensor_name, sizeof(sensor_name),
+                                     sensor_zone, sizeof(sensor_zone))) {
             ESP_LOGI(TAG, "Pending sensor received: %s. Saving provisional NVS and starting ESP-NOW", sensor_mac);
-            nvs_prov_save_sensor(sensor_mac, provision_key);
-            espnow_pair_sensor(sensor_mac, provision_key);
-
-            // Don't break — keep polling immediately for more pending sensors
-            // (batch: user may have registered multiple sensors before pressing button)
-            memset(sensor_mac, 0, sizeof(sensor_mac));
-            memset(provision_key, 0, sizeof(provision_key));
-            continue;
+            s_pair_sensor_claimed = true;
+            nvs_prov_save_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
+            espnow_pair_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
+            break;
         }
 
         vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_INTERVAL_MS));
@@ -80,6 +80,7 @@ void sensor_pairing_open_window(void)
     }
 
     g_mode = MODE_SENSOR_PAIRING;
+    s_pair_sensor_claimed = false;
     ESP_LOGI(TAG, "Mode transition: SENSOR_PAIRING");
     api_enable_sensor_pairing();
 

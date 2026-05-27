@@ -61,10 +61,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         if (!s_initial_connect) {
             // WiFi recovered mid-operation.
             // If there is an unfinished sensor pairing in provisional NVS, retry it.
-            char prov_mac[18] = {0}, prov_key[33] = {0};
-            if (nvs_prov_load_sensor(prov_mac, prov_key)) {
+            char prov_mac[18] = {0}, prov_key[33] = {0}, prov_name[32] = {0}, prov_zone[32] = {0};
+            if (nvs_prov_load_sensor(prov_mac, prov_key,
+                                     prov_name, sizeof(prov_name),
+                                     prov_zone, sizeof(prov_zone))) {
                 ESP_LOGI(TAG, "WiFi back — resuming provisional sensor pairing for %s", prov_mac);
-                espnow_pair_sensor(prov_mac, prov_key);
+                espnow_pair_sensor(prov_mac, prov_key, prov_name, prov_zone);
             }
         }
     }
@@ -136,10 +138,12 @@ void wifi_connect(const char *ssid, const char *password)
             espnow_reconnect_saved_sensors();
 
             // Also check if a sensor pairing was interrupted (provisional NVS)
-            char prov_mac[18] = {0}, prov_key[33] = {0};
-            if (nvs_prov_load_sensor(prov_mac, prov_key)) {
+            char prov_mac[18] = {0}, prov_key[33] = {0}, prov_name[32] = {0}, prov_zone[32] = {0};
+            if (nvs_prov_load_sensor(prov_mac, prov_key,
+                                     prov_name, sizeof(prov_name),
+                                     prov_zone, sizeof(prov_zone))) {
                 ESP_LOGI(TAG, "Found interrupted sensor pairing — resuming for %s", prov_mac);
-                espnow_pair_sensor(prov_mac, prov_key);
+                espnow_pair_sensor(prov_mac, prov_key, prov_name, prov_zone);
             }
         } else {
             // First boot — register with server

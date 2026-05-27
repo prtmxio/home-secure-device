@@ -189,19 +189,24 @@ uint8_t nvs_load_fingerprints(uint16_t *slots, uint8_t max_slots)
     return loaded;
 }
 
-void nvs_save_sensors(const char macs[][18], const uint8_t keys[][16], int count)
+void nvs_save_sensors(const char macs[][18], const uint8_t keys[][16],
+                      const char names[][32], const char zones[][32], int count)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
 
     nvs_set_u8(h, "sensor_count", (uint8_t)count);
     for (int i = 0; i < count; i++) {
-        char mac_key[24], lmk_key[24];
+        char mac_key[24], lmk_key[24], name_key[24], zone_key[24];
         snprintf(mac_key, sizeof(mac_key), "sensor_%d", i);
         snprintf(lmk_key, sizeof(lmk_key), "sensor_key_%d", i);
+        snprintf(name_key, sizeof(name_key), "sensor_name_%d", i);
+        snprintf(zone_key, sizeof(zone_key), "sensor_zone_%d", i);
 
         nvs_set_str(h, mac_key, macs[i]);
         nvs_set_blob(h, lmk_key, keys[i], 16);
+        nvs_set_str(h, name_key, names ? names[i] : "");
+        nvs_set_str(h, zone_key, zones ? zones[i] : "");
     }
 
     nvs_commit(h);
@@ -232,7 +237,8 @@ bool nvs_load_sensor_enabled(int index, bool default_enabled)
     return value != 0;
 }
 
-int nvs_load_sensors(char macs[][18], uint8_t keys[][16], int max_count)
+int nvs_load_sensors(char macs[][18], uint8_t keys[][16],
+                     char names[][32], char zones[][32], int max_count)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return 0;
@@ -243,9 +249,11 @@ int nvs_load_sensors(char macs[][18], uint8_t keys[][16], int max_count)
 
     int loaded = 0;
     for (int i = 0; i < count; i++) {
-        char mac_key[24], lmk_key[24];
+        char mac_key[24], lmk_key[24], name_key[24], zone_key[24];
         snprintf(mac_key, sizeof(mac_key), "sensor_%d", i);
         snprintf(lmk_key, sizeof(lmk_key), "sensor_key_%d", i);
+        snprintf(name_key, sizeof(name_key), "sensor_name_%d", i);
+        snprintf(zone_key, sizeof(zone_key), "sensor_zone_%d", i);
 
         size_t mac_len = 18;
         if (nvs_get_str(h, mac_key, macs[loaded], &mac_len) != ESP_OK) continue;
@@ -259,6 +267,19 @@ int nvs_load_sensors(char macs[][18], uint8_t keys[][16], int max_count)
             }
         }
 
+        if (names != NULL) {
+            size_t name_len = 32;
+            if (nvs_get_str(h, name_key, names[loaded], &name_len) != ESP_OK) {
+                names[loaded][0] = '\0';
+            }
+        }
+        if (zones != NULL) {
+            size_t zone_len = 32;
+            if (nvs_get_str(h, zone_key, zones[loaded], &zone_len) != ESP_OK) {
+                zones[loaded][0] = '\0';
+            }
+        }
+
         loaded++;
     }
 
@@ -269,7 +290,8 @@ int nvs_load_sensors(char macs[][18], uint8_t keys[][16], int max_count)
 
 // ── Provisional namespace ──────────────────────────────────────────────────
 
-void nvs_prov_save_sensor(const char *sensor_mac, const char *provision_key_hex)
+void nvs_prov_save_sensor(const char *sensor_mac, const char *provision_key_hex,
+                          const char *name, const char *zone)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_PROV, NVS_READWRITE, &h) != ESP_OK) {
@@ -278,12 +300,16 @@ void nvs_prov_save_sensor(const char *sensor_mac, const char *provision_key_hex)
     }
     nvs_set_str(h, "prov_mac", sensor_mac);
     nvs_set_str(h, "prov_key", provision_key_hex);
+    nvs_set_str(h, "prov_name", name ? name : "");
+    nvs_set_str(h, "prov_zone", zone ? zone : "");
     nvs_commit(h);
     nvs_close(h);
     ESP_LOGI(TAG, "Provisional sensor saved: %s", sensor_mac);
 }
 
-bool nvs_prov_load_sensor(char *out_sensor_mac, char *out_provision_key_hex)
+bool nvs_prov_load_sensor(char *out_sensor_mac, char *out_provision_key_hex,
+                          char *out_name, size_t out_name_len,
+                          char *out_zone, size_t out_zone_len)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_PROV, NVS_READONLY, &h) != ESP_OK) return false;
@@ -293,6 +319,18 @@ bool nvs_prov_load_sensor(char *out_sensor_mac, char *out_provision_key_hex)
     if (ok) {
         len = 33;
         ok = (nvs_get_str(h, "prov_key", out_provision_key_hex, &len) == ESP_OK);
+    }
+    if (ok && out_name && out_name_len > 0) {
+        len = out_name_len;
+        if (nvs_get_str(h, "prov_name", out_name, &len) != ESP_OK) {
+            out_name[0] = '\0';
+        }
+    }
+    if (ok && out_zone && out_zone_len > 0) {
+        len = out_zone_len;
+        if (nvs_get_str(h, "prov_zone", out_zone, &len) != ESP_OK) {
+            out_zone[0] = '\0';
+        }
     }
 
     nvs_close(h);

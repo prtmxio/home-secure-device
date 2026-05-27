@@ -158,7 +158,9 @@ void api_enable_sensor_pairing(void)
     }
 }
 
-bool api_fetch_sensor_pairing(char *out_sensor_mac, char *out_provision_key_hex)
+bool api_fetch_sensor_pairing(char *out_sensor_mac, char *out_provision_key_hex,
+                              char *out_name, size_t out_name_len,
+                              char *out_zone, size_t out_zone_len)
 {
     static uint32_t no_pending_count = 0;
     int status = do_get("/api/device/hubs/pending-sensor");
@@ -181,8 +183,10 @@ bool api_fetch_sensor_pairing(char *out_sensor_mac, char *out_provision_key_hex)
         return false;
     }
 
-    cJSON *mac = cJSON_GetObjectItem(root, "sensorMacAddress");
-    cJSON *key = cJSON_GetObjectItem(root, "provisionKey");
+    cJSON *mac  = cJSON_GetObjectItem(root, "sensorMacAddress");
+    cJSON *key  = cJSON_GetObjectItem(root, "provisionKey");
+    cJSON *name = cJSON_GetObjectItem(root, "name");
+    cJSON *zone = cJSON_GetObjectItem(root, "zone");
 
     bool ok = cJSON_IsString(mac) && mac->valuestring &&
               cJSON_IsString(key) && key->valuestring;
@@ -192,8 +196,25 @@ bool api_fetch_sensor_pairing(char *out_sensor_mac, char *out_provision_key_hex)
         strncpy(out_provision_key_hex,  key->valuestring, 32);
         out_sensor_mac[17]        = '\0';
         out_provision_key_hex[32] = '\0';
-        ESP_LOGI(TAG, "Fetched pending sensor: %s provision_key_len=%u",
-                 out_sensor_mac, (unsigned)strlen(out_provision_key_hex));
+        if (out_name && out_name_len > 0) {
+            if (cJSON_IsString(name) && name->valuestring) {
+                strncpy(out_name, name->valuestring, out_name_len - 1);
+                out_name[out_name_len - 1] = '\0';
+            } else {
+                out_name[0] = '\0';
+            }
+        }
+        if (out_zone && out_zone_len > 0) {
+            if (cJSON_IsString(zone) && zone->valuestring) {
+                strncpy(out_zone, zone->valuestring, out_zone_len - 1);
+                out_zone[out_zone_len - 1] = '\0';
+            } else {
+                out_zone[0] = '\0';
+            }
+        }
+        ESP_LOGI(TAG, "Fetched pending sensor: %s provision_key_len=%u zone=%s",
+                 out_sensor_mac, (unsigned)strlen(out_provision_key_hex),
+                 (out_zone && out_zone[0]) ? out_zone : "Unknown");
     } else {
         ESP_LOGW(TAG, "Pending sensor response missing sensorMacAddress/provisionKey");
     }
