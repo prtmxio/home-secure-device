@@ -7,7 +7,6 @@
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
-#include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -60,9 +59,6 @@ typedef struct {
     uint8_t lmk[16];   // LMK = provision_key bytes
     bool    paired;    // true once ACK received
     bool    enabled;
-    bool    has_reading;
-    float   temp;
-    float   hum;
 } sensor_entry_t;
 
 static sensor_entry_t s_sensors[MAX_SENSORS];
@@ -95,23 +91,6 @@ static int sensor_index_from_entry(sensor_entry_t *entry)
 {
     if (!entry) return -1;
     return (int)(entry - s_sensors);
-}
-
-static void parse_sensor_reading(sensor_entry_t *entry, const char *payload)
-{
-    if (!entry || !payload) return;
-    cJSON *root = cJSON_Parse(payload);
-    if (!root) return;
-
-    cJSON *temp = cJSON_GetObjectItem(root, "temp");
-    cJSON *hum = cJSON_GetObjectItem(root, "hum");
-    if (cJSON_IsNumber(temp) && cJSON_IsNumber(hum)) {
-        entry->temp = (float)temp->valuedouble;
-        entry->hum = (float)hum->valuedouble;
-        entry->has_reading = true;
-    }
-
-    cJSON_Delete(root);
 }
 
 // ── Receive callback ──────────────────────────────────────────────────────
@@ -170,17 +149,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
             return;
         }
 
-        ESP_LOGI(TAG, "Event from %s: %s", mac_str, pkt->payload);
+        ESP_LOGI(TAG, "Event received from %s", mac_str);
         if (!entry->enabled || g_mode == MODE_OFFLINE) {
             ESP_LOGI(TAG, "Dropping event from disabled/offline sensor %s", mac_str);
             return;
-        }
-
-        parse_sensor_reading(entry, pkt->payload);
-        float temp = 0.0f;
-        float hum = 0.0f;
-        if (espnow_get_first_sensor_reading(&temp, &hum)) {
-            display_update_temp_hum(temp, hum);
         }
 
         event_item_t item;
@@ -197,11 +169,19 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
     }
 }
 
-static void espnow_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
+static void espnow_send_cb(const esp_now_send_info_t *tx_info, esp_now_send_status_t status)
 {
-    ESP_LOGI(TAG, "Send to %02X:%02X:%02X:%02X:%02X:%02X: %s",
-        mac_addr[0], mac_addr[1], mac_addr[2],
-        mac_addr[3], mac_addr[4], mac_addr[5],
+    const uint8_t *mac_addr = (tx_info != NULL) ? tx_info->des_addr : NULL;
+
+    if (mac_addr) {
+        ESP_LOGI(TAG, "Send to %02X:%02X:%02X:%02X:%02X:%02X: %s",
+            mac_addr[0], mac_addr[1], mac_addr[2],
+            mac_addr[3], mac_addr[4], mac_addr[5],
+            status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAILED");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Send status: %s",
         status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAILED");
 }
 
@@ -351,7 +331,6 @@ void espnow_pair_sensor(const char *sensor_mac_str, const char *provision_key_he
     hex_to_bytes(provision_key_hex, entry->lmk, 16);
     entry->paired = false;
     entry->enabled = true;
-    entry->has_reading = false;
     s_sensor_count++;
 
     if (!esp_now_is_peer_exist(entry->mac)) {
@@ -421,7 +400,6 @@ void espnow_reconnect_saved_sensors(void)
         memcpy(entry->lmk, keys[i], 16);
         entry->paired = false;   // will be set true on ACK
         entry->enabled = nvs_load_sensor_enabled(i, true);
-        entry->has_reading = false;
         s_sensor_count++;
 
         if (!esp_now_is_peer_exist(entry->mac)) {
@@ -476,16 +454,4 @@ void espnow_set_sensor_enabled(int index, bool enabled)
     s_sensors[index].enabled = enabled;
     nvs_save_sensor_enabled(index, enabled);
     ESP_LOGI(TAG, "Sensor S%d %s", index + 1, enabled ? "enabled" : "disabled");
-}
-
-bool espnow_get_first_sensor_reading(float *out_temp, float *out_hum)
-{
-    for (int i = 0; i < s_sensor_count; i++) {
-        if (s_sensors[i].enabled && s_sensors[i].has_reading) {
-            if (out_temp) *out_temp = s_sensors[i].temp;
-            if (out_hum) *out_hum = s_sensors[i].hum;
-            return true;
-        }
-    }
-    return false;
 }

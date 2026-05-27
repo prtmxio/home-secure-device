@@ -30,9 +30,9 @@ extern char g_pending_sensor_mac[18];    // e.g. "AA:BB:CC:DD:EE:FF"
 extern char g_pending_provision_key[33]; // 32-char hex of 16-byte LMK
 
 // ── Server Config ─────────────────────────────────────────────────────────
-#define SERVER_IP      "10.82.248.6"
+#define SERVER_IP      "10.186.209.6"
 #define SERVER_PORT    3000
-#define SERVER_BASE    "http://10.82.248.6:3000"
+#define SERVER_BASE    "http://10.186.209.6:3000"
 #define DEVICE_API_KEY "glazia-device-dev-key"
 #define BLE_DEVICE_NAME "GlaziaHub"
 
@@ -56,8 +56,7 @@ extern char g_pending_provision_key[33]; // 32-char hex of 16-byte LMK
 
 // Touch — XPT2046 resistive touch controller on same SPI2 bus as LCD
 // T_CLK shares LCD_PIN_SCK (GPIO12), T_DIN shares LCD_PIN_MOSI (GPIO4)
-// Wire: T_OUT→GPIO2, T_CS→GPIO5, T_IRQ→GPIO17
-//       (set TOUCH_PIN_IRQ to -1 if T_IRQ left unwired)
+
 #define TOUCH_PIN_MISO  2   // T_OUT
 #define TOUCH_PIN_CS     5   // T_CS
 #define TOUCH_PIN_IRQ   17   // T_IRQ

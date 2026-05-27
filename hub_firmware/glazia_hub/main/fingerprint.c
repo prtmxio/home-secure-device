@@ -51,6 +51,7 @@ static const char *TAG = "FINGERPRINT";
 #define R307_ERR_NO_MATCH 0x09
 #define R307_ERR_REG_MODEL_FAIL 0x0A
 #define R307_ERR_BAD_PAGE 0x0B
+#define R307_ERR_INVALID_RANGE 0x17
 #define R307_ERR_FLASH_WRITE 0x18
 
 #define FP_ENROLL_SLOT 1
@@ -149,6 +150,8 @@ static const char *r307_confirm_name(uint8_t confirm)
         return "failed to combine character files";
     case R307_ERR_BAD_PAGE:
         return "template page is out of range";
+    case R307_ERR_INVALID_RANGE:
+        return "invalid search range";
     case R307_ERR_FLASH_WRITE:
         return "flash write failed";
     default:
@@ -448,6 +451,17 @@ esp_err_t fp_enroll(void)
     return ESP_FAIL;
 }
 
+static bool fp_slot_is_authorized(const uint16_t *slots, uint8_t count, uint16_t slot)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        if (slots[i] == slot) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static esp_err_t fp_verify_once(int attempt_num)
 {
     const TickType_t start = xTaskGetTickCount();
@@ -466,33 +480,53 @@ static esp_err_t fp_verify_once(int attempt_num)
 
     uint16_t slots[FP_MAX_PRINTS] = {0};
     uint8_t count = nvs_load_fingerprints(slots, FP_MAX_PRINTS);
-    for (uint8_t i = 0; i < count; i++) {
-        const uint8_t search_params[] = {
-            0x01,
-            (uint8_t)(slots[i] >> 8),
-            (uint8_t)(slots[i] & 0xFF),
-            0x00,
-            0x01,
-        };
-
-        r307_response_t response = {0};
-        esp_err_t err = r307_cmd(R307_CMD_SEARCH, search_params, sizeof(search_params), &response);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Search failed for slot %u: %s", slots[i], esp_err_to_name(err));
-            continue;
-        }
-
-        if (response.confirm == R307_OK && response.data_len >= 4) {
-            const uint16_t matched_slot = ((uint16_t)response.data[0] << 8) | response.data[1];
-            const uint16_t score = ((uint16_t)response.data[2] << 8) | response.data[3];
-            ESP_LOGI(TAG, "Match found: slot=%u score=%u", matched_slot, score);
-            result = ESP_OK;
-            goto done;
-        }
-
-        ESP_LOGW(TAG, "Search result slot %u: 0x%02X (%s)",
-                 slots[i], response.confirm, r307_confirm_name(response.confirm));
+    if (count == 0) {
+        ESP_LOGW(TAG, "No fingerprint slots loaded from NVS on verify attempt %d", attempt_num);
+        goto done;
     }
+
+    uint16_t min_slot = slots[0];
+    uint16_t max_slot = slots[0];
+    for (uint8_t i = 0; i < count; i++) {
+        ESP_LOGI(TAG, "Authorized fingerprint slot[%u]=%u", i, slots[i]);
+        if (slots[i] < min_slot) min_slot = slots[i];
+        if (slots[i] > max_slot) max_slot = slots[i];
+    }
+
+    const uint16_t page_count = (uint16_t)(max_slot - min_slot + 1);
+    const uint8_t search_params[] = {
+        0x01,
+        (uint8_t)(min_slot >> 8),
+        (uint8_t)(min_slot & 0xFF),
+        (uint8_t)(page_count >> 8),
+        (uint8_t)(page_count & 0xFF),
+    };
+
+    ESP_LOGI(TAG, "Searching fingerprint slots %u..%u (%u page(s)) on attempt %d",
+             min_slot, max_slot, page_count, attempt_num);
+
+    r307_response_t response = {0};
+    esp_err_t err = r307_cmd(R307_CMD_SEARCH, search_params, sizeof(search_params), &response);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Search failed for slots %u..%u: %s",
+                 min_slot, max_slot, esp_err_to_name(err));
+        goto done;
+    }
+
+    if (response.confirm == R307_OK && response.data_len >= 4) {
+        const uint16_t matched_slot = ((uint16_t)response.data[0] << 8) | response.data[1];
+        const uint16_t score = ((uint16_t)response.data[2] << 8) | response.data[3];
+        ESP_LOGI(TAG, "Match found: slot=%u score=%u", matched_slot, score);
+        if (fp_slot_is_authorized(slots, count, matched_slot)) {
+            result = ESP_OK;
+        } else {
+            ESP_LOGW(TAG, "Matched fingerprint slot %u is not authorized by NVS", matched_slot);
+        }
+        goto done;
+    }
+
+    ESP_LOGW(TAG, "Search result slots %u..%u: 0x%02X (%s)",
+             min_slot, max_slot, response.confirm, r307_confirm_name(response.confirm));
 
 done:
     delay_until_tick(deadline);
@@ -567,7 +601,7 @@ static void fp_enroll_task(void *arg)
 
     ESP_LOGI(TAG, "Fingerprint enrollment task started");
     g_mode = MODE_FINGERPRINT_ENROLL;
-    display_show_fingerprint_screen("Add Fingerprint", "Place your finger on the sensor");
+    display_show_fingerprint_screen("Registration", "Place your finger on the sensor");
 
     esp_err_t err = fp_enroll();
     if (err == ESP_OK) {

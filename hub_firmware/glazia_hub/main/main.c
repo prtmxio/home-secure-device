@@ -4,6 +4,7 @@
 #include "button.h"
 #include "display.h"
 #include "fingerprint.h"
+#include "hub_sensor.h"
 #include "state.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -39,6 +40,14 @@ void app_main(void) {
     ESP_LOGI(TAG, "display_init starting");
     display_init();
     ESP_LOGI(TAG, "display_init queued/done");
+
+    ESP_LOGI(TAG, "hub_sensor_init starting");
+    esp_err_t hub_sensor_err = hub_sensor_init();
+    if (hub_sensor_err != ESP_OK) {
+        ESP_LOGW(TAG, "Hub sensor init failed: %s", esp_err_to_name(hub_sensor_err));
+    } else {
+        ESP_LOGI(TAG, "Hub DHT22 sensor ready");
+    }
 
     ESP_LOGI(TAG, "fp_init starting");
     esp_err_t fp_err = fp_init();

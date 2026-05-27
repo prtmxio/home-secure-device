@@ -115,7 +115,7 @@ void button_task(void *arg)
 
                 } else if (g_mode == MODE_OPERATIONAL && strlen(g_hub_secret) > 0) {
                     ESP_LOGI(TAG, "Registered hub button action: fingerprint gate before sensor pairing");
-                    display_show_fingerprint_screen("Verify Fingerprint", "Place your finger on the sensor");
+                    display_show_fingerprint_screen("Authentication", "Place your finger on the sensor");
                     g_mode = MODE_FINGERPRINT_VERIFY;
                     ESP_LOGI(TAG, "Mode transition: FINGERPRINT_VERIFY");
                     if (fp_verify() == ESP_OK) {

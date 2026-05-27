@@ -3,9 +3,6 @@
 
 #include "lvgl.h"
 
-#if !LV_FONT_MONTSERRAT_8
-#define lv_font_montserrat_8 lv_font_montserrat_10
-#endif
 #if !LV_FONT_MONTSERRAT_16
 #define lv_font_montserrat_16 lv_font_montserrat_14
 #endif

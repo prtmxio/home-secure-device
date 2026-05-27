@@ -9,4 +9,5 @@ idf_component_register(
         driver
         bt
         log
+        esp_timer
 )

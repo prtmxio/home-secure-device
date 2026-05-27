@@ -9,6 +9,7 @@ idf_component_register(
         "api_client.c"
         "espnow.c"
         "display.c"
+        "hub_sensor.c"
         "fingerprint.c"
         "nvs_storage.c"
         ${UI_SRCS}
@@ -25,5 +26,7 @@ idf_component_register(
         spi_flash
         log
         esp_lcd
+        esp_lcd_touch
+        esp_lcd_touch_xpt2046
         esp_timer
 )

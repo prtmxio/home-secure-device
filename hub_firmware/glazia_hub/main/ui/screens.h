@@ -62,7 +62,7 @@ typedef struct _objects_t {
     lv_obj_t *obj10;
     lv_obj_t *hum_val;
     lv_obj_t *obj11;
-    lv_obj_t *temp_mood_1;
+    lv_obj_t *hum_mood;
     lv_obj_t *obj12;
     lv_obj_t *settings_menu_cont;
     lv_obj_t *obj13;
@@ -98,7 +98,7 @@ typedef struct _objects_t {
     lv_obj_t *obj26;
     lv_obj_t *temp_val_1;
     lv_obj_t *obj27;
-    lv_obj_t *temp_mood_2;
+    lv_obj_t *temp_mood_1;
     lv_obj_t *obj28;
     lv_obj_t *hum_cont_1;
     lv_obj_t *hum_label_1;
@@ -109,7 +109,7 @@ typedef struct _objects_t {
     lv_obj_t *obj31;
     lv_obj_t *hum_val_1;
     lv_obj_t *obj32;
-    lv_obj_t *temp_mood_3;
+    lv_obj_t *hum_mood_1;
     lv_obj_t *obj33;
     lv_obj_t *settings_menu_cont_1;
     lv_obj_t *sensor_1;

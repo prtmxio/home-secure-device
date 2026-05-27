@@ -26,12 +26,15 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_ili9341.h"
+#include "esp_lcd_touch.h"
+#include "esp_lcd_touch_xpt2046.h"
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
 #include <string.h>
@@ -103,183 +106,124 @@ static void configure_screen_locked(enum ScreensEnum screen);
 static void refresh_sensor_nodes_locked(void);
 static void set_online_dashboard_locked(void);
 static void set_offline_dashboard_locked(bool setup);
+static void cache_copy(char *dst, size_t dst_size, const char *src);
+static void cache_lock(void);
+static void cache_unlock(void);
+static const char *nonnull_text(const char *text, const char *fallback);
 static const char *fingerprint_phase_for_title(const char *title);
 static const char *fingerprint_message_normalize(const char *message);
+static void align_fingerprint_text_locked(void);
+static void show_fingerprint_screen_locked(const char *title, const char *prompt);
 static bool display_is_ready(void);
 static void cache_apply_locked(void);
+static void make_touch_target(lv_obj_t *obj);
+static void make_touch_target_tree(lv_obj_t *obj);
+static void make_back_touch_target(lv_obj_t *obj);
+static void xpt2046_process_coordinates(esp_lcd_touch_handle_t tp, uint16_t *x, uint16_t *y,
+                                        uint16_t *strength, uint8_t *point_num,
+                                        uint8_t max_point_num);
 
-/* ── XPT2046 touch — raw SPI device (no registry component needed) ───────── */
-static spi_device_handle_t s_tp_spi = NULL;
+/* ── XPT2046 touch — official esp_lcd_touch driver ──────────────────────── */
+static esp_lcd_touch_handle_t s_tp = NULL;
 static lv_indev_t         *s_tp_indev = NULL;
-static lv_indev_drv_t      s_tp_drv;
+static lv_disp_t          *s_lvgl_disp = NULL;
 /* ── Hardware init ───────────────────────────────────────────────────────── */
 
 /*
- * XPT2046 calibration constants — derived from observed raw ADC min/max.
- *
- * On this panel the axes are physically swapped relative to the ILI9341:
- *   0xD0 (XPT2046 "X") → measures the VERTICAL position (screen Y)
- *   0x90 (XPT2046 "Y") → measures the HORIZONTAL position (screen X)
- *
- * The LCD is initialised with mirror(true, false) — X axis is flipped —
- * so the touch horizontal coordinate must also be mirrored.
- *
- * Adjust these if the touch boundary feels off after calibration:
+ * Calibration constants measured by the standalone touch calibration app.
+ * The official XPT2046 driver now owns SPI/PENIRQ/sample acquisition; this
+ * callback only maps stable raw ADC coordinates into LVGL screen pixels.
  */
-#define TP_X_RAW_MIN   0    /* 0x90 reading at the left   edge of the panel */
-#define TP_X_RAW_MAX   1300    /* 0x90 reading at the right  edge of the panel (corrected for this hardware) */
-#define TP_Y_RAW_MIN  1173   /* 0xD0 reading at the top edge of the panel */
-#define TP_Y_RAW_MAX  2465    /* 0xD0 reading at the bottom edge of the panel */
-
 /*
- * XPT2046 single-channel read.
- * cmd: 0xD0 = X axis, 0x90 = Y axis  (12-bit differential mode)
- * Protocol: send 1 command byte + 2 zero bytes; result is in bytes 1–2,
- * bits [14:3], so right-shift by 3 to get the 12-bit ADC value (0–4095).
+ * Raw endpoints from the official XPT2046 driver:
+ *   top-left     ~= (240, 3800)
+ *   top-right    ~= (3700, 3800)
+ *   bottom-left  ~= (345, 550)
+ *   toggle area  ~= (260, 360..460)
+ *
+ * raw_x increases left-to-right. raw_y decreases top-to-bottom.
  */
-static uint16_t xpt2046_read_raw(uint8_t cmd)
-{
-    uint8_t tx[3] = {cmd, 0x00, 0x00};
-    uint8_t rx[3] = {0x00, 0x00, 0x00};
-    spi_transaction_t t = {
-        .length    = 24,        /* 3 bytes */
-        .tx_buffer = tx,
-        .rx_buffer = rx,
-    };
-    spi_device_transmit(s_tp_spi, &t);
-    uint16_t result = (((uint16_t)rx[1] << 8) | rx[2]) >> 3;
+#define TP_RAW_LEFT      240
+#define TP_RAW_RIGHT    3700
+#define TP_RAW_TOP      3800
+#define TP_RAW_BOTTOM   430
 
-    return result;
+#define TP_CAL_MARGIN_RAW 300
+#define TP_DEBUG_TOUCH_LOGS 1
+
+static bool raw_in_range_with_margin(uint16_t value, uint16_t a, uint16_t b)
+{
+    int min = a < b ? a : b;
+    int max = a < b ? b : a;
+    return (int)value >= min - TP_CAL_MARGIN_RAW && (int)value <= max + TP_CAL_MARGIN_RAW;
 }
 
-/*
- * Average 8 successive reads of the same channel.
- * XPT2046 is noisy; a single read can jump ~30 px, which LVGL's click
- * detector treats as a drag and never fires LV_EVENT_CLICKED on the switch.
- * Averaging stabilises the reported position to within ~3 px.
- */
-static uint16_t xpt2046_read_avg(uint8_t cmd)
+static uint16_t clamp_u16(int value, int min, int max)
 {
-    uint32_t sum = 0;
-    for (int i = 0; i < 6; i++) {
-        sum += xpt2046_read_raw(cmd);
-    }
-    return (uint16_t)(sum / 6);
+    if (value < min) return (uint16_t)min;
+    if (value > max) return (uint16_t)max;
+    return (uint16_t)value;
 }
 
-/*
- * LVGL input-device read callback — called from the LVGL task on every tick.
- * T_IRQ is active-low: LOW = panel touched.
- */
-
-static void xpt2046_read_cb(lv_indev_drv_t *drv,
-                            lv_indev_data_t *data)
+static bool map_xpt2046_coordinate(uint16_t raw_x, uint16_t raw_y,
+                                   uint16_t *screen_x, uint16_t *screen_y)
 {
-    LV_UNUSED(drv);
+    const float raw_width = (float)(TP_RAW_RIGHT - TP_RAW_LEFT);
+    const float raw_height = (float)(TP_RAW_TOP - TP_RAW_BOTTOM);
 
-    static bool s_last_pressed = false;
-
-    bool pressed =
-        (gpio_get_level(TOUCH_PIN_IRQ) == 0);
-
-
-    if (pressed) {
-
-        /*
-         * 0xD0 -> vertical
-         * 0x90 -> horizontal
-         */
-
-        uint16_t raw_phys_y =
-            xpt2046_read_avg(0xD0);
-
-        uint16_t raw_phys_x =
-            xpt2046_read_avg(0x90);
-
-        if (raw_phys_x > 3500 || raw_phys_y > 3500) { data->state = LV_INDEV_STATE_RELEASED; return; }
-
-        /*
-         * Clamp
-         */
-
-        if (raw_phys_x < TP_X_RAW_MIN)
-            raw_phys_x = TP_X_RAW_MIN;
-
-        if (raw_phys_x > TP_X_RAW_MAX)
-            raw_phys_x = TP_X_RAW_MAX;
-
-        if (raw_phys_y < TP_Y_RAW_MIN)
-            raw_phys_y = TP_Y_RAW_MIN;
-
-        if (raw_phys_y > TP_Y_RAW_MAX)
-            raw_phys_y = TP_Y_RAW_MAX;
-
-        /*
-         * Interpolate
-         */
-
-        lv_coord_t px =
-            (lv_coord_t)(
-                ((uint32_t)(raw_phys_x - TP_X_RAW_MIN)
-                * (LCD_H_RES - 1))
-                / (TP_X_RAW_MAX - TP_X_RAW_MIN)
-            );
-
-        lv_coord_t py =
-            (lv_coord_t)(
-                ((uint32_t)(raw_phys_y - TP_Y_RAW_MIN)
-                * (LCD_V_RES - 1))
-                / (TP_Y_RAW_MAX - TP_Y_RAW_MIN)
-            );
-
-        /*
-         * LCD mirrored in X
-         */
-
-        px = (LCD_H_RES - 1) - px;
-
-
-        /*
-            * Final clamp
-         */
-
-        if (px < 0)
-            px = 0;
-
-        if (px >= LCD_H_RES)
-            px = LCD_H_RES - 1;
-
-        if (py < 0)
-            py = 0;
-
-        if (py >= LCD_V_RES)
-            py = LCD_V_RES - 1;
-
-        data->point.x = px;
-        data->point.y = py;
-
-        static uint32_t dbg_counter = 0;
-
-        if ((dbg_counter++ % 10) == 0) {
-            ESP_LOGI(TAG,
-                     "TOUCH raw=(%u,%u) px=(%d,%d)",
-                     raw_phys_x,
-                     raw_phys_y,
-                     px,
-                     py);
-        }
+    if (raw_width == 0.0f || raw_height == 0.0f) {
+        return false;
     }
 
-    if (!pressed && s_last_pressed) {
-        ESP_LOGI(TAG, "TOUCH released");
+    if (!raw_in_range_with_margin(raw_x, TP_RAW_LEFT, TP_RAW_RIGHT) ||
+        !raw_in_range_with_margin(raw_y, TP_RAW_BOTTOM, TP_RAW_TOP)) {
+        return false;
     }
 
-    s_last_pressed = pressed;
+    const float mapped_x = ((float)((int)raw_x - TP_RAW_LEFT) / raw_width) * (float)(LCD_H_RES - 1);
+    const float mapped_y = ((float)(TP_RAW_TOP - (int)raw_y) / raw_height) * (float)(LCD_V_RES - 1);
 
-    data->state =
-        pressed
-        ? LV_INDEV_STATE_PRESSED
-        : LV_INDEV_STATE_RELEASED;
+    *screen_x = clamp_u16((int)(mapped_x + 0.5f), 0, LCD_H_RES - 1);
+    *screen_y = clamp_u16((int)(mapped_y + 0.5f), 0, LCD_V_RES - 1);
+    return true;
+}
+
+static void xpt2046_process_coordinates(esp_lcd_touch_handle_t tp, uint16_t *x, uint16_t *y,
+                                        uint16_t *strength, uint8_t *point_num,
+                                        uint8_t max_point_num)
+{
+    LV_UNUSED(tp);
+    LV_UNUSED(max_point_num);
+
+    if (!x || !y || !point_num || *point_num == 0) {
+        return;
+    }
+
+    const uint16_t raw_x = x[0];
+    const uint16_t raw_y = y[0];
+    uint16_t mapped_x = 0;
+    uint16_t mapped_y = 0;
+    bool valid = map_xpt2046_coordinate(raw_x, raw_y, &mapped_x, &mapped_y);
+
+    if (!valid) {
+        *point_num = 0;
+    } else {
+        x[0] = mapped_x;
+        y[0] = mapped_y;
+    }
+
+#if TP_DEBUG_TOUCH_LOGS
+    static int64_t s_last_log_us = 0;
+    int64_t now_us = esp_timer_get_time();
+    if (now_us - s_last_log_us > 250000) {
+        ESP_LOGI(TAG, "TOUCH raw=(%u,%u) strength=%u %s pixel=(%u,%u) screen=%d",
+                 raw_x, raw_y, strength ? strength[0] : 0,
+                 valid ? "mapped" : "rejected",
+                 valid ? mapped_x : 0, valid ? mapped_y : 0,
+                 (int)s_current_screen);
+        s_last_log_us = now_us;
+    }
+#endif
 }
 
 typedef struct {
@@ -319,7 +263,8 @@ static void auth_toggle_task(void *arg)
     free(a);
 
     g_mode = MODE_FINGERPRINT_VERIFY;
-    display_show_fingerprint_screen("Verify Fingerprint", "Place your finger on the sensor");
+    display_show_fingerprint_screen("Authentication", "Place your finger on the sensor");
+    vTaskDelay(pdMS_TO_TICKS(350));
     esp_err_t result = fp_verify();
 
     if (result == ESP_OK) {
@@ -332,7 +277,8 @@ static void auth_toggle_task(void *arg)
             }
             g_mode = MODE_OPERATIONAL;
         } else if (action == AUTH_ACTION_ADD_FINGERPRINT) {
-            display_show_fingerprint_screen("Add Fingerprint", "Place your finger on the sensor");
+            display_show_fingerprint_screen("Registration", "Place your finger on the sensor");
+            vTaskDelay(pdMS_TO_TICKS(350));
             g_mode = MODE_FINGERPRINT_ENROLL;
             if (fp_enroll() == ESP_OK) {
                 display_fingerprint_status("Registration completed");
@@ -515,36 +461,6 @@ static esp_err_t lcd_hw_init(void)
     }
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    /* T_IRQ: active-low open-drain output from XPT2046 — pull up internally */
-    gpio_config_t irq_cfg = {
-        .pin_bit_mask = 1ULL << TOUCH_PIN_IRQ,
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_LOGI(TAG, "Display init: touch IRQ GPIO config");
-    err = gpio_config(&irq_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Display init: touch IRQ GPIO config failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    /* Register XPT2046 as a separate SPI device on SPI2 */
-    spi_device_interface_config_t tp_devcfg = {
-        .clock_speed_hz = 1000 * 1000,  // 1 MHz
-        .mode           = 0,                 // SPI mode 0 (CPOL=0, CPHA=0)
-        .spics_io_num   = TOUCH_PIN_CS,      // GPIO5
-        .queue_size     = 1,
-        .flags          = 0,
-    };
-    ESP_LOGI(TAG, "Display init: adding touch SPI device");
-    err = spi_bus_add_device(LCD_SPI_HOST, &tp_devcfg, &s_tp_spi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Display init: touch SPI device add failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
     /* Hand off to LVGL port */
     const lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     ESP_LOGI(TAG, "Display init: LVGL port init");
@@ -566,11 +482,56 @@ static esp_err_t lcd_hw_init(void)
     };
     ESP_LOGI(TAG, "Display init: adding LVGL display, free internal heap=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    if (!lvgl_port_add_disp(&disp_cfg)) {
+    s_lvgl_disp = lvgl_port_add_disp(&disp_cfg);
+    if (!s_lvgl_disp) {
         ESP_LOGE(TAG, "Display init: lvgl_port_add_disp returned NULL");
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "Display init: LVGL display registered");
+
+    esp_lcd_panel_io_handle_t tp_io = NULL;
+    esp_lcd_panel_io_spi_config_t tp_io_cfg = ESP_LCD_TOUCH_IO_SPI_XPT2046_CONFIG(TOUCH_PIN_CS);
+    ESP_LOGI(TAG, "Display init: creating XPT2046 touch IO");
+    err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_HOST, &tp_io_cfg, &tp_io);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Display init: touch IO create failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const esp_lcd_touch_config_t tp_cfg = {
+        .x_max = LCD_H_RES,
+        .y_max = LCD_V_RES,
+        .rst_gpio_num = GPIO_NUM_NC,
+        .int_gpio_num = TOUCH_PIN_IRQ,
+        .levels = {
+            .reset = 0,
+            .interrupt = 0,
+        },
+        .flags = {
+            .swap_xy = false,
+            .mirror_x = false,
+            .mirror_y = false,
+        },
+        .process_coordinates = xpt2046_process_coordinates,
+    };
+    ESP_LOGI(TAG, "Display init: creating XPT2046 touch driver");
+    err = esp_lcd_touch_new_spi_xpt2046(tp_io, &tp_cfg, &s_tp);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Display init: touch driver create failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const lvgl_port_touch_cfg_t touch_cfg = {
+        .disp = s_lvgl_disp,
+        .handle = s_tp,
+    };
+    s_tp_indev = lvgl_port_add_touch(&touch_cfg);
+    if (!s_tp_indev) {
+        ESP_LOGE(TAG, "Display init: lvgl_port_add_touch returned NULL");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Display init: XPT2046 touch registered, IRQ GPIO%d level=%d",
+             TOUCH_PIN_IRQ, gpio_get_level(TOUCH_PIN_IRQ));
     return ESP_OK;
 }
 
@@ -596,11 +557,74 @@ static void set_switch_checked_locked(lv_obj_t *sw, bool checked)
     s_switch_internal = false;
 }
 
+static void make_touch_target(lv_obj_t *obj)
+{
+    if (!obj) return;
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_PRESS_LOCK);
+    lv_obj_set_ext_click_area(obj, 6);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+static void clear_child_click_targets(lv_obj_t *obj)
+{
+    if (!obj) return;
+
+    uint32_t child_count = lv_obj_get_child_cnt(obj);
+    for (uint32_t i = 0; i < child_count; i++) {
+        lv_obj_t *child = lv_obj_get_child(obj, i);
+        if (!child) continue;
+        lv_obj_clear_flag(child, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(child, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+        lv_obj_clear_flag(child, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(child, LV_OBJ_FLAG_EVENT_BUBBLE);
+        clear_child_click_targets(child);
+    }
+}
+
+static void make_touch_target_tree(lv_obj_t *obj)
+{
+    if (!obj) return;
+
+    make_touch_target(obj);
+    clear_child_click_targets(obj);
+}
+
+static void make_back_touch_target(lv_obj_t *obj)
+{
+    if (!obj) return;
+    make_touch_target_tree(obj);
+    lv_obj_set_ext_click_area(obj, 14);
+}
+
 static void set_label_locked(lv_obj_t *label, const char *text)
 {
     if (label && text) {
         lv_label_set_text(label, text);
     }
+}
+
+static void show_fingerprint_screen_locked(const char *title, const char *prompt)
+{
+    const char *phase = fingerprint_phase_for_title(title);
+    const char *message = fingerprint_message_normalize(nonnull_text(prompt, "Place your finger on the sensor"));
+
+    cache_lock();
+    s_display_cache.view = CACHE_VIEW_FINGERPRINT;
+    cache_copy(s_display_cache.fp_title, sizeof(s_display_cache.fp_title), title ? title : "Fingerprint");
+    cache_copy(s_display_cache.fp_phase, sizeof(s_display_cache.fp_phase), phase);
+    cache_copy(s_display_cache.fp_message, sizeof(s_display_cache.fp_message), message);
+    s_display_cache.fp_progress = 0;
+    cache_unlock();
+
+    s_prev_screen = s_current_screen;
+    load_screen_locked(SCREEN_ID_FINGERPRINT_SETTING);
+    set_label_locked(objects.obj53, title ? title : "Fingerprint");
+    set_label_locked(objects.obj49, phase);
+    set_label_locked(objects.obj52, message);
+    align_fingerprint_text_locked();
+    if (objects.obj51) lv_bar_set_value(objects.obj51, 0, LV_ANIM_OFF);
 }
 
 static void cache_copy(char *dst, size_t dst_size, const char *src)
@@ -655,7 +679,8 @@ static void set_offline_dashboard_locked(bool setup)
 
 static const char *fingerprint_phase_for_title(const char *title)
 {
-    if (title && (strstr(title, "Verify") || strstr(title, "verify"))) {
+    if (title && (strstr(title, "Verify") || strstr(title, "verify") ||
+                  strstr(title, "Authentication") || strstr(title, "authentication"))) {
         return "Verifying your fingerprint";
     }
     return "Registering your fingerprint";
@@ -683,6 +708,33 @@ static const char *fingerprint_message_normalize(const char *message)
     return message;
 }
 
+static void align_dashboard_value_locked(lv_obj_t *value, lv_obj_t *arc)
+{
+    if (value && arc) {
+        lv_obj_align_to(value, arc, LV_ALIGN_CENTER, 0, -3);
+    }
+}
+
+static void align_fingerprint_text_locked(void)
+{
+    if (objects.obj53) {
+        lv_obj_set_pos(objects.obj53, 0, 18);
+        lv_obj_set_width(objects.obj53, 240);
+        lv_obj_set_style_text_align(objects.obj53, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    }
+    if (objects.obj49) {
+        lv_obj_set_pos(objects.obj49, 0, 148);
+        lv_obj_set_width(objects.obj49, 240);
+        lv_obj_set_style_text_font(objects.obj49, &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_align(objects.obj49, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    }
+    if (objects.obj52) {
+        lv_obj_set_pos(objects.obj52, 0, 214);
+        lv_obj_set_width(objects.obj52, 240);
+        lv_obj_set_style_text_align(objects.obj52, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    }
+}
+
 static void set_dashboard_values_locked(float temp, float hum)
 {
     char buf[16];
@@ -694,12 +746,16 @@ static void set_dashboard_values_locked(float temp, float hum)
     snprintf(buf, sizeof(buf), "%.1f", temp);
     set_label_locked(objects.temp_val, buf);
     set_label_locked(objects.temp_val_1, buf);
+    align_dashboard_value_locked(objects.temp_val, objects.temp_arc);
+    align_dashboard_value_locked(objects.temp_val_1, objects.temp_arc_1);
     if (objects.temp_arc) lv_arc_set_value(objects.temp_arc, (int)temp);
     if (objects.temp_arc_1) lv_arc_set_value(objects.temp_arc_1, (int)temp);
 
     snprintf(buf, sizeof(buf), "%.0f", hum);
     set_label_locked(objects.hum_val, buf);
     set_label_locked(objects.hum_val_1, buf);
+    align_dashboard_value_locked(objects.hum_val, objects.hum_arc);
+    align_dashboard_value_locked(objects.hum_val_1, objects.hum_arc_1);
     if (objects.hum_arc) lv_arc_set_value(objects.hum_arc, (int)hum);
     if (objects.hum_arc_1) lv_arc_set_value(objects.hum_arc_1, (int)hum);
 }
@@ -725,6 +781,7 @@ static void cache_apply_locked(void)
         set_label_locked(objects.obj52,
                          fingerprint_message_normalize(nonnull_text(s_display_cache.fp_message,
                                                                     "Place your finger on the sensor")));
+        align_fingerprint_text_locked();
         if (objects.obj51) lv_bar_set_value(objects.obj51, s_display_cache.fp_progress, LV_ANIM_OFF);
         break;
     case CACHE_VIEW_NONE:
@@ -760,6 +817,7 @@ static void cache_apply_locked(void)
 static void nav_back_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    ESP_LOGI(TAG, "Touch: Back");
     enum ScreensEnum target = SCREEN_ID_HUB_ONLINE;
     if (s_current_screen == SCREEN_ID_ABOUT_GLAZIA ||
         s_current_screen == SCREEN_ID_SENSOR_NODES_SETTING ||
@@ -781,6 +839,7 @@ static void nav_back_cb(lv_event_t *e)
 static void settings_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    ESP_LOGI(TAG, "Touch: Settings");
     s_prev_screen = s_ui_online ? SCREEN_ID_HUB_ONLINE : SCREEN_ID_HUB_OFFLINE;
     if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
         load_screen_locked(SCREEN_ID_SETTINGS_MENU);
@@ -791,6 +850,7 @@ static void settings_cb(lv_event_t *e)
 static void sensor_nodes_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    ESP_LOGI(TAG, "Touch: Sensor Nodes");
     if (lvgl_port_lock(pdMS_TO_TICKS(500))) {
         load_screen_locked(SCREEN_ID_SENSOR_NODES_SETTING);
         refresh_sensor_nodes_locked();
@@ -801,6 +861,7 @@ static void sensor_nodes_cb(lv_event_t *e)
 static void about_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    ESP_LOGI(TAG, "Touch: About");
     if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
         load_screen_locked(SCREEN_ID_ABOUT_GLAZIA);
         lvgl_port_unlock();
@@ -810,18 +871,22 @@ static void about_cb(lv_event_t *e)
 static void add_fingerprint_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    ESP_LOGI(TAG, "Touch: Add Fingerprint");
+    show_fingerprint_screen_locked("Authentication", "Place your finger on the sensor");
     start_auth_action(AUTH_ACTION_ADD_FINGERPRINT, NULL, false);
 }
 
 static void add_sensor_auth_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    ESP_LOGI(TAG, "Touch: Add Sensor");
     start_auth_action(AUTH_ACTION_ADD_SENSOR, NULL, false);
 }
 
 static void add_sensor_start_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    ESP_LOGI(TAG, "Touch: Start Sensor Pairing");
     sensor_pairing_open_window();
 }
 
@@ -831,6 +896,7 @@ static void sensor_switch_cb(lv_event_t *e)
     lv_obj_t *sw = lv_event_get_target(e);
     int index = (int)(intptr_t)lv_event_get_user_data(e);
     bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    ESP_LOGI(TAG, "Touch: Sensor %d %s", index, enabled ? "enabled" : "disabled");
     espnow_set_sensor_enabled(index, enabled);
 }
 
@@ -854,6 +920,7 @@ static void create_sensor_row(lv_obj_t *parent, int index, const char *name, boo
     lv_obj_t *sw = lv_switch_create(row);
     lv_obj_set_pos(sw, 165, 15);
     lv_obj_set_size(sw, 50, 20);
+    make_touch_target(sw);
     set_switch_checked_locked(sw, enabled);
     lv_obj_add_event_cb(sw, sensor_switch_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)index);
 }
@@ -867,17 +934,25 @@ static void configure_screen_locked(enum ScreensEnum screen)
     switch (screen) {
     case SCREEN_ID_HUB_ONLINE:
         s_critical_sw = objects.obj1;
+        make_touch_target(objects.obj1);
+        make_touch_target_tree(objects.button);
         if (objects.obj1) lv_obj_add_event_cb(objects.obj1, critical_toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
         if (objects.button) lv_obj_add_event_cb(objects.button, settings_cb, LV_EVENT_CLICKED, NULL);
         set_dashboard_values_locked(0.0f, 0.0f);
         break;
 
     case SCREEN_ID_HUB_OFFLINE:
+        make_touch_target(objects.obj22);
+        make_touch_target_tree(objects.button_1);
         if (objects.obj22) lv_obj_add_event_cb(objects.obj22, critical_toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
         if (objects.button_1) lv_obj_add_event_cb(objects.button_1, settings_cb, LV_EVENT_CLICKED, NULL);
         break;
 
     case SCREEN_ID_SETTINGS_MENU:
+        make_back_touch_target(objects.obj14);
+        make_touch_target_tree(objects.fingerprint_option);
+        make_touch_target_tree(objects.sensor_nodes_option);
+        make_touch_target_tree(objects.about_section);
         if (objects.obj14) lv_obj_add_event_cb(objects.obj14, nav_back_cb, LV_EVENT_CLICKED, NULL);
         if (objects.fingerprint_option) lv_obj_add_event_cb(objects.fingerprint_option, add_fingerprint_cb, LV_EVENT_CLICKED, NULL);
         if (objects.sensor_nodes_option) lv_obj_add_event_cb(objects.sensor_nodes_option, sensor_nodes_cb, LV_EVENT_CLICKED, NULL);
@@ -885,6 +960,8 @@ static void configure_screen_locked(enum ScreensEnum screen)
         break;
 
     case SCREEN_ID_SENSOR_NODES_SETTING:
+        make_back_touch_target(objects.obj44);
+        make_touch_target_tree(objects.add_sensor_button);
         if (objects.settings_menu_cont_1) {
             lv_obj_set_scroll_dir(objects.settings_menu_cont_1, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(objects.settings_menu_cont_1, LV_SCROLLBAR_MODE_ACTIVE);
@@ -899,11 +976,13 @@ static void configure_screen_locked(enum ScreensEnum screen)
             lv_obj_set_scroll_dir(about_parent, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(about_parent, LV_SCROLLBAR_MODE_ACTIVE);
         }
+        make_back_touch_target(objects.obj47);
         if (objects.obj47) lv_obj_add_event_cb(objects.obj47, nav_back_cb, LV_EVENT_CLICKED, NULL);
         break;
     }
 
     case SCREEN_ID_FINGERPRINT_SETTING:
+        make_back_touch_target(objects.obj54);
         if (objects.obj54) lv_obj_add_event_cb(objects.obj54, nav_back_cb, LV_EVENT_CLICKED, NULL);
         if (objects.obj51) lv_bar_set_value(objects.obj51, 0, LV_ANIM_OFF);
         break;
@@ -914,6 +993,8 @@ static void configure_screen_locked(enum ScreensEnum screen)
             lv_obj_set_scrollbar_mode(objects.added_sensor_data, LV_SCROLLBAR_MODE_ACTIVE);
             lv_obj_clean(objects.added_sensor_data);
         }
+        make_back_touch_target(objects.obj55);
+        make_touch_target_tree(objects.obj59);
         if (objects.obj55) lv_obj_add_event_cb(objects.obj55, nav_back_cb, LV_EVENT_CLICKED, NULL);
         if (objects.obj59) lv_obj_add_event_cb(objects.obj59, add_sensor_start_cb, LV_EVENT_CLICKED, NULL);
         break;
@@ -953,17 +1034,6 @@ static void display_init_task(void *arg)
     ui_init();
     ESP_LOGI(TAG, "Display init: ui_init done");
     configure_screen_locked(SCREEN_ID_HUB_ONLINE);
-
-    /* Register XPT2046 as LVGL pointer input device inside the lock */
-    ESP_LOGI(TAG, "Display init: registering touch input");
-    lv_indev_drv_init(&s_tp_drv);
-    s_tp_drv.type         = LV_INDEV_TYPE_POINTER;
-    s_tp_drv.read_cb      = xpt2046_read_cb;
-    s_tp_drv.scroll_limit = 50;
-    s_tp_indev = lv_indev_drv_register(&s_tp_drv);
-    if (!s_tp_indev) {
-        ESP_LOGW(TAG, "Display init: touch input registration returned NULL");
-    }
 
     s_display_state = DISPLAY_READY;
     cache_apply_locked();
@@ -1093,6 +1163,7 @@ void display_fingerprint_status(const char *message)
 
     if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
         set_label_locked(objects.obj52, fingerprint_message_normalize(message));
+        align_fingerprint_text_locked();
         lvgl_port_unlock();
     }
 }
@@ -1157,31 +1228,24 @@ void display_show_dashboard(bool online)
 
 void display_show_fingerprint_screen(const char *title, const char *prompt)
 {
-    const char *phase = fingerprint_phase_for_title(title);
-    const char *message = fingerprint_message_normalize(nonnull_text(prompt, "Place your finger on the sensor"));
-
-    cache_lock();
-    s_display_cache.view = CACHE_VIEW_FINGERPRINT;
-    cache_copy(s_display_cache.fp_title, sizeof(s_display_cache.fp_title), title ? title : "Fingerprint");
-    cache_copy(s_display_cache.fp_phase, sizeof(s_display_cache.fp_phase), phase);
-    cache_copy(s_display_cache.fp_message, sizeof(s_display_cache.fp_message), message);
-    s_display_cache.fp_progress = 0;
-    cache_unlock();
-
-    ESP_LOGI(TAG, "Fingerprint screen: title='%s' phase='%s' message='%s'",
-             title ? title : "Fingerprint", phase, message);
+    ESP_LOGI(TAG, "Fingerprint screen: title='%s' prompt='%s'",
+             title ? title : "Fingerprint",
+             prompt ? prompt : "Place your finger on the sensor");
     if (!display_is_ready()) {
         ESP_LOGI(TAG, "Display not ready, cached fingerprint screen only (state=%d)", (int)s_display_state);
+        cache_lock();
+        s_display_cache.view = CACHE_VIEW_FINGERPRINT;
+        cache_copy(s_display_cache.fp_title, sizeof(s_display_cache.fp_title), title ? title : "Fingerprint");
+        cache_copy(s_display_cache.fp_phase, sizeof(s_display_cache.fp_phase), fingerprint_phase_for_title(title));
+        cache_copy(s_display_cache.fp_message, sizeof(s_display_cache.fp_message),
+                   fingerprint_message_normalize(nonnull_text(prompt, "Place your finger on the sensor")));
+        s_display_cache.fp_progress = 0;
+        cache_unlock();
         return;
     }
 
     if (!lvgl_port_lock(pdMS_TO_TICKS(500))) return;
-    s_prev_screen = s_current_screen;
-    load_screen_locked(SCREEN_ID_FINGERPRINT_SETTING);
-    set_label_locked(objects.obj53, title ? title : "Fingerprint");
-    set_label_locked(objects.obj49, phase);
-    set_label_locked(objects.obj52, message);
-    if (objects.obj51) lv_bar_set_value(objects.obj51, 0, LV_ANIM_OFF);
+    show_fingerprint_screen_locked(title, prompt);
     lvgl_port_unlock();
 }
 
@@ -1205,6 +1269,7 @@ void display_fingerprint_phase(const char *phase, const char *message)
     if (lvgl_port_lock(pdMS_TO_TICKS(200))) {
         set_label_locked(objects.obj49, phase);
         set_label_locked(objects.obj52, normalized);
+        align_fingerprint_text_locked();
         lvgl_port_unlock();
     }
 }

@@ -60,7 +60,6 @@ static void check_and_proceed(void)
     if (got_ssid && got_password && got_token) {
         ESP_LOGI(TAG, "All BLE credentials received for SSID '%s'; starting WiFi transition",
                  g_wifi_ssid);
-        display_show("Got Creds!", "Connecting WiFi");
 
         // Reset the token flag so this doesn't accidentally trigger twice
         got_token = false;
