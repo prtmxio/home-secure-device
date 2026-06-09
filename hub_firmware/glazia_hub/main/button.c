@@ -61,6 +61,7 @@ static void sensor_poll_task(void *arg)
             s_pair_sensor_claimed = true;
             nvs_prov_save_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
             espnow_pair_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
+            memset(provision_key, 0, sizeof(provision_key));
             break;
         }
 

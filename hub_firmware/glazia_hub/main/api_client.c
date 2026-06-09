@@ -7,12 +7,15 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <string.h>
 
 static const char *TAG = "API";
 
-static char resp_buf[1024];
-static int  resp_len  = 0;
+static char             resp_buf[1024];
+static int              resp_len  = 0;
+static SemaphoreHandle_t s_api_mutex = NULL;
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
@@ -32,6 +35,11 @@ static int do_request(esp_http_client_method_t method, const char *path,
                       const char *body,
                       const char *extra_hdr_key, const char *extra_hdr_val)
 {
+    if (s_api_mutex == NULL) {
+        s_api_mutex = xSemaphoreCreateMutex();
+    }
+    xSemaphoreTake(s_api_mutex, portMAX_DELAY);
+
     resp_len = 0;
     memset(resp_buf, 0, sizeof(resp_buf));
 
@@ -82,6 +90,7 @@ static int do_request(esp_http_client_method_t method, const char *path,
     }
 
     esp_http_client_cleanup(client);
+    xSemaphoreGive(s_api_mutex);
     return status;
 }
 
@@ -143,7 +152,7 @@ void api_register_hub(void)
         display_hub_location(g_home_name);
         fp_start_enroll_if_needed();
         hub_control_ws_start();
-        ESP_LOGI(TAG, "Hub registered! Home: %s  Secret prefix: %.8s...", g_home_name, g_hub_secret);
+        ESP_LOGI(TAG, "[DEV-LOG:REMOVE_BEFORE_PROD] Hub registered! Home: %s  Secret prefix: %.8s...", g_home_name, g_hub_secret);
     } else {
         ESP_LOGE(TAG, "Registration failed: HTTP %d", status);
     }

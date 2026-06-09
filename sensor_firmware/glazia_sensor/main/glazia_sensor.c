@@ -127,14 +127,32 @@ static void hex_to_bytes(const char *hex, uint8_t *out, int len) {
   }
 }
 
-static void mac_str_to_bytes(const char *s, uint8_t *b) {
-  sscanf(s, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &b[0], &b[1], &b[2], &b[3], &b[4],
-         &b[5]);
+static bool mac_str_to_bytes(const char *s, uint8_t *b) {
+  int matched = sscanf(s, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &b[0], &b[1], &b[2],
+                       &b[3], &b[4], &b[5]);
+  if (matched != 6) {
+    ESP_LOGW(TAG, "mac_str_to_bytes: invalid MAC (matched %d/6 for '%s')", matched, s);
+    memset(b, 0, 6);
+    return false;
+  }
+  return true;
 }
 
 static void mac_bytes_to_str(const uint8_t *mac, char *out) {
   snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2],
            mac[3], mac[4], mac[5]);
+}
+
+static bool is_valid_mac_format(const char *mac) {
+  if (!mac || strlen(mac) != 17) return false;
+  for (int i = 0; i < 17; i++) {
+    if (i == 2 || i == 5 || i == 8 || i == 11 || i == 14) {
+      if (mac[i] != ':') return false;
+    } else {
+      if (!isxdigit((unsigned char)mac[i])) return false;
+    }
+  }
+  return true;
 }
 
 static void normalize_mac_string(char *mac) {
@@ -212,7 +230,7 @@ static void nvs_save_pair(const char *ns, const char *hub_mac,
   nvs_set_str(h, "prov_key", prov_key);
   nvs_commit(h);
   nvs_close(h);
-  ESP_LOGI(TAG, "NVS[%s] saved: hub=%s", ns, hub_mac);
+  ESP_LOGI(TAG, "[DEV-LOG:REMOVE_BEFORE_PROD] NVS[%s] saved: hub=%s", ns, hub_mac);
 }
 
 static bool nvs_load_pair(const char *ns, char *hub_mac, char *prov_key) {
@@ -332,7 +350,11 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     int hub_ch = 0;
     mac_bytes_to_str(info->src_addr, src_mac);
 
-    if (!parse_pair_payload(pkt->payload, hello_hub, sizeof(hello_hub),
+    char safe_payload[128];
+    memcpy(safe_payload, pkt->payload, sizeof(safe_payload) - 1);
+    safe_payload[127] = '\0';
+
+    if (!parse_pair_payload(safe_payload, hello_hub, sizeof(hello_hub),
                             hello_sensor, sizeof(hello_sensor), hello_nonce,
                             sizeof(hello_nonce), &hub_ch)) {
       ESP_LOGW(TAG, "Malformed HELLO from %s", src_mac);
@@ -369,6 +391,10 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     s_pending_ack.hub_mac[sizeof(s_pending_ack.hub_mac) - 1] = '\0';
     s_pending_ack.sensor_mac[sizeof(s_pending_ack.sensor_mac) - 1] = '\0';
     s_pending_ack.nonce[sizeof(s_pending_ack.nonce) - 1] = '\0';
+    if (hub_ch != 0 && (hub_ch < 1 || hub_ch > 13)) {
+      ESP_LOGW(TAG, "HELLO: invalid channel %d from %s — using current channel", hub_ch, src_mac);
+      hub_ch = 0;
+    }
     s_pending_ack.hub_channel = hub_ch > 0 ? (uint8_t)hub_ch : 0;
     ESP_LOGI(TAG, "HELLO accepted — stopping scan and scheduling ACK");
     if (s_ack_task_handle) {
@@ -381,7 +407,11 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     char commit_nonce[17] = {0};
     mac_bytes_to_str(info->src_addr, src_mac);
 
-    if (!parse_pair_payload(pkt->payload, commit_hub, sizeof(commit_hub),
+    char safe_commit_payload[128];
+    memcpy(safe_commit_payload, pkt->payload, sizeof(safe_commit_payload) - 1);
+    safe_commit_payload[127] = '\0';
+
+    if (!parse_pair_payload(safe_commit_payload, commit_hub, sizeof(commit_hub),
                             commit_sensor, sizeof(commit_sensor),
                             commit_nonce, sizeof(commit_nonce), NULL)) {
       ESP_LOGW(TAG, "Malformed COMMIT from %s", src_mac);
@@ -540,7 +570,7 @@ static int gatt_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     os_mbuf_copydata(ctxt->om, 0, n, s_ble_hub_mac);
     s_ble_hub_mac[n] = '\0';
     normalize_mac_string(s_ble_hub_mac);
-    ESP_LOGI(TAG, "BLE: hub_mac = %s", s_ble_hub_mac);
+    ESP_LOGI(TAG, "[DEV-LOG:REMOVE_BEFORE_PROD] BLE: hub_mac = %s", s_ble_hub_mac);
   } else if (uuid16 == 0xFF11) {
     uint16_t n = data_len < 32 ? data_len : 32;
     os_mbuf_copydata(ctxt->om, 0, n, s_ble_prov_key);
@@ -548,8 +578,8 @@ static int gatt_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     ESP_LOGI(TAG, "BLE: provision_key received (%d chars)", n);
   }
 
-  // Trigger when both are valid
-  if (strlen(s_ble_hub_mac) >= 17 && strlen(s_ble_prov_key) == 32) {
+  // Trigger when both are valid; enforce MAC format before accepting (E6)
+  if (is_valid_mac_format(s_ble_hub_mac) && strlen(s_ble_prov_key) == 32) {
     s_ble_got_creds = true;
     s_ble_conn_handle = conn_handle;
     xSemaphoreGive(s_ble_done_sem);
@@ -744,9 +774,15 @@ void app_main(void) {
   normalize_mac_string(hub_mac_str);
   strncpy(s_ble_hub_mac, hub_mac_str, sizeof(s_ble_hub_mac) - 1);
   s_ble_hub_mac[sizeof(s_ble_hub_mac) - 1] = '\0';
-  mac_str_to_bytes(hub_mac_str, s_hub_mac_bytes);
+  if (!mac_str_to_bytes(hub_mac_str, s_hub_mac_bytes)) {
+    ESP_LOGE(TAG, "Invalid hub MAC format in storage — clearing NVS and restarting");
+    nvs_erase_ns(NVS_MAIN_NS);
+    nvs_erase_ns(NVS_PROV_NS);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+  }
   hex_to_bytes(prov_key_hex, s_lmk, 16);
-  ESP_LOGI(TAG, "Hub MAC: %s  LMK: loaded", hub_mac_str);
+  ESP_LOGI(TAG, "[DEV-LOG:REMOVE_BEFORE_PROD] Hub MAC: %s  LMK: loaded", hub_mac_str);
 
   // ── WiFi + ESP-NOW ────────────────────────────────────────────────────
   wifi_init_for_espnow();
@@ -776,6 +812,7 @@ void app_main(void) {
       // COMMIT received — promote provisional credentials to main storage.
       nvs_save_pair(NVS_MAIN_NS, hub_mac_str, prov_key_hex);
       nvs_erase_ns(NVS_PROV_NS);
+      memset(prov_key_hex, 0, sizeof(prov_key_hex));
       ESP_LOGI(TAG, "Pairing confirmed — promoted to main NVS");
       xTaskCreate(event_task, "events", 3072, NULL, 5, NULL);
     } else {

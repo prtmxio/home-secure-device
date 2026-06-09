@@ -30,9 +30,9 @@ static void log_token_summary(const char *label, const char *token)
 {
     size_t len = token ? strlen(token) : 0;
     if (len >= 4) {
-        ESP_LOGI(TAG, "%s received: len=%u suffix=%.4s", label, (unsigned)len, token + len - 4);
+        ESP_LOGI(TAG, "[DEV-LOG:REMOVE_BEFORE_PROD] %s received: len=%u suffix=%.4s", label, (unsigned)len, token + len - 4);
     } else {
-        ESP_LOGI(TAG, "%s received: len=%u", label, (unsigned)len);
+        ESP_LOGI(TAG, "[DEV-LOG:REMOVE_BEFORE_PROD] %s received: len=%u", label, (unsigned)len);
     }
 }
 

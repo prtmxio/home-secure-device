@@ -247,10 +247,14 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
             return;
         }
 
+        char safe_payload[128];
+        memcpy(safe_payload, pkt->payload, sizeof(safe_payload) - 1);
+        safe_payload[127] = '\0';
+
         char ack_hub[18] = {0};
         char ack_sensor[18] = {0};
         char ack_nonce[17] = {0};
-        if (!parse_pair_payload(pkt->payload, ack_hub, sizeof(ack_hub),
+        if (!parse_pair_payload(safe_payload, ack_hub, sizeof(ack_hub),
                                 ack_sensor, sizeof(ack_sensor),
                                 ack_nonce, sizeof(ack_nonce))) {
             ESP_LOGW(TAG, "Malformed ACK from %s — ignoring", mac_str);
