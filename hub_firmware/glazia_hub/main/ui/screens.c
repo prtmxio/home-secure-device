@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "../state.h"
 #include "screens.h"
 #include "images.h"
 #include "fonts.h"
@@ -422,15 +423,13 @@ void create_screen_add_another__sensor()
     add_nav_title(obj, "Add Sensor", UI_COLOR_AMBER, &objects.obj55);
 
     lv_obj_t *card_obj = card(obj, PAGE_X, 58, PAGE_W, 206, 13);
-    lv_obj_t *node_badge = panel(card_obj, 82, 22, 60, 60, 16);
-    icon(node_badge, &img_nodes, 0, 0, 124, UI_COLOR_AMBER, true);
-    label(card_obj, "Register a New Sensor", 0, 98, PAGE_W, 18,
-          &lv_font_montserrat_14, UI_COLOR_TEXT_PRIMARY,
-          LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_DOT);
-    objects.obj56 = label(card_obj,
-        "Register the desired sensor to the Server first. Once done, press the Add Sensor button below.",
-        18, 128, 188, 52, &lv_font_montserrat_10, UI_COLOR_TEXT_SECONDARY,
-        LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_WRAP);
+    lv_obj_t *qr = lv_qrcode_create(card_obj, 160, lv_color_black(), lv_color_white());
+    lv_obj_set_pos(qr, 32, 12);
+    lv_obj_clear_flag(qr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_qrcode_update(qr, g_hub_mac, (uint32_t)strlen(g_hub_mac));
+    label(card_obj, "Scan QR to add sensor", 0, 176, PAGE_W, 12,
+          &lv_font_montserrat_10, UI_COLOR_TEXT_SECONDARY,
+          LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_CLIP);
 
     objects.added_sensor_data = card(obj, PAGE_X, 58, PAGE_W, 206, 13);
     lv_obj_add_flag(objects.added_sensor_data, LV_OBJ_FLAG_HIDDEN);

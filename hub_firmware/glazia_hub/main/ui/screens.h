@@ -103,7 +103,6 @@ typedef struct _objects_t {
     lv_obj_t *obj54;
     /* ── add_another__sensor widgets ────────────────────────── */
     lv_obj_t *obj55;
-    lv_obj_t *obj56;
     lv_obj_t *added_sensor_data;
     lv_obj_t *obj57;
     lv_obj_t *obj58;
