@@ -74,6 +74,7 @@ static const char *TAG = "SENSOR";
 #define PKT_ACK 0x02
 #define PKT_EVENT 0x03
 #define PKT_COMMIT 0x04
+#define PKT_RESET 0x05
 
 typedef struct {
   uint8_t type;
@@ -441,6 +442,18 @@ static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data,
     s_pair_state = PAIR_COMPLETE;
     s_hub_paired = true;
     s_scan_stop = true;
+  } else if (pkt->type == PKT_RESET) {
+    if (memcmp(info->src_addr, s_hub_mac_bytes, 6) != 0) {
+      char src_mac[18] = {0};
+      mac_bytes_to_str(info->src_addr, src_mac);
+      ESP_LOGW(TAG, "PKT_RESET from unknown sender %s — ignoring", src_mac);
+      return;
+    }
+    ESP_LOGW(TAG, "PKT_RESET from hub — erasing NVS and restarting");
+    nvs_erase_ns(NVS_MAIN_NS);
+    nvs_erase_ns(NVS_PROV_NS);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_restart();
   }
 }
 

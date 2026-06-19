@@ -9,7 +9,9 @@
 #include "door_lock.h"
 #include "esp_log.h"
 #include "esp_crt_bundle.h"
+#include "esp_system.h"
 #include "esp_websocket_client.h"
+#include "espnow.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -212,6 +214,38 @@ static void handle_camera_stream_command(cJSON *root)
     }
 }
 
+static void handle_sensor_delete_command(cJSON *root)
+{
+    cJSON *mac = cJSON_GetObjectItem(root, "sensorMacAddress");
+    if (!cJSON_IsString(mac) || !mac->valuestring || mac->valuestring[0] == '\0') {
+        ESP_LOGW(TAG, "sensor_delete_command missing sensorMacAddress");
+        return;
+    }
+    esp_err_t err = espnow_remove_sensor(mac->valuestring);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Sensor %s removed via server command", mac->valuestring);
+        display_sensor_list();
+    } else {
+        ESP_LOGW(TAG, "Sensor %s not in peer table (already removed?)", mac->valuestring);
+    }
+}
+
+static void handle_hub_reset_command(cJSON *root)
+{
+    cJSON *action = cJSON_GetObjectItem(root, "action");
+    if (!cJSON_IsString(action) || strcmp(action->valuestring, "format_and_reset") != 0) {
+        ESP_LOGW(TAG, "hub_reset_command: unknown action '%s' — ignoring",
+                 cJSON_IsString(action) ? action->valuestring : "null");
+        return;
+    }
+    ESP_LOGW(TAG, "hub_reset_command received — notifying sensors, erasing NVS, restarting");
+    espnow_send_reset_to_all_sensors();
+    nvs_clear_credentials();
+    nvs_prov_clear();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_restart();
+}
+
 static void handle_ws_text(const char *data, int len)
 {
     cJSON *root = cJSON_ParseWithLength(data, len);
@@ -229,6 +263,10 @@ static void handle_ws_text(const char *data, int len)
             handle_door_lock_command(root);
         } else if (strcmp(type->valuestring, "camera_stream_command") == 0) {
             handle_camera_stream_command(root);
+        } else if (strcmp(type->valuestring, "sensor_delete_command") == 0) {
+            handle_sensor_delete_command(root);
+        } else if (strcmp(type->valuestring, "hub_reset_command") == 0) {
+            handle_hub_reset_command(root);
         } else if (strcmp(type->valuestring, "door_lock_ack_received") == 0) {
             ESP_LOGI(TAG, "Server received door lock ACK");
         } else if (strcmp(type->valuestring, "error") == 0) {

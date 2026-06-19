@@ -24,6 +24,7 @@ static const char *TAG = "ESPNOW";
 #define PKT_ACK     0x02
 #define PKT_EVENT   0x03
 #define PKT_COMMIT  0x04
+#define PKT_RESET   0x05
 
 typedef struct {
     uint8_t type;
@@ -657,4 +658,48 @@ void espnow_set_sensor_enabled(int index, bool enabled)
     s_sensors[index].enabled = enabled;
     nvs_save_sensor_enabled(index, enabled);
     ESP_LOGI(TAG, "Sensor S%d %s", index + 1, enabled ? "enabled" : "disabled");
+}
+
+static void send_pkt_reset(const uint8_t *mac)
+{
+    espnow_packet_t pkt = { .type = PKT_RESET };
+    pkt.payload[0] = '\0';
+    char mac_str[18];
+    mac_bytes_to_str(mac, mac_str);
+    esp_err_t err = esp_now_send(mac, (uint8_t *)&pkt, sizeof(pkt));
+    ESP_LOGI(TAG, "PKT_RESET to %s: %s", mac_str, err == ESP_OK ? "queued" : esp_err_to_name(err));
+}
+
+esp_err_t espnow_remove_sensor(const char *sensor_mac_str)
+{
+    uint8_t mac[6];
+    mac_str_to_bytes(sensor_mac_str, mac);
+    sensor_entry_t *entry = find_sensor_by_mac(mac);
+    if (!entry) {
+        ESP_LOGW(TAG, "espnow_remove_sensor: %s not in peer table", sensor_mac_str);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (entry->paired) {
+        send_pkt_reset(entry->mac);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    remove_sensor_entry(entry);
+    commit_sensor_table();
+    ESP_LOGI(TAG, "Sensor %s removed from peer table and NVS; remaining=%d",
+             sensor_mac_str, s_sensor_count);
+    return ESP_OK;
+}
+
+void espnow_send_reset_to_all_sensors(void)
+{
+    for (int i = 0; i < s_sensor_count; i++) {
+        if (s_sensors[i].paired) {
+            send_pkt_reset(s_sensors[i].mac);
+        }
+    }
+    if (s_sensor_count > 0) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }

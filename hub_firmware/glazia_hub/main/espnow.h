@@ -1,4 +1,5 @@
 #pragma once
+#include "esp_err.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -29,3 +30,12 @@ void espnow_get_sensor_list_str(char *out, size_t out_len);
 int espnow_get_sensor_count(void);
 bool espnow_get_sensor_info(int index, char *out_name, size_t out_name_len, bool *out_enabled, bool *out_paired);
 void espnow_set_sensor_enabled(int index, bool enabled);
+
+// Remove a paired sensor by MAC string: sends PKT_RESET to sensor (best-effort),
+// deletes ESP-NOW peer, and saves the updated sensor table to NVS.
+// Returns ESP_ERR_NOT_FOUND if the MAC is not in the peer table.
+esp_err_t espnow_remove_sensor(const char *sensor_mac_str);
+
+// Send PKT_RESET to every currently-paired sensor peer (best-effort, no retry).
+// Call before hub NVS erase/restart so sensors can clear their own NVS.
+void espnow_send_reset_to_all_sensors(void);
