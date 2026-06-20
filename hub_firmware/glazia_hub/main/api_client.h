@@ -15,6 +15,9 @@ bool api_fetch_sensor_pairing(char *out_sensor_mac, char *out_provision_key_hex,
                               char *out_name, size_t out_name_len,
                               char *out_zone, size_t out_zone_len);
 
+// Called after ESP-NOW pairing is confirmed — tells server sensor is live
+bool api_confirm_sensor(const char *sensor_mac);
+
 // Called when sensor sends an event — forwards to server
 bool api_send_event(const char *sensor_mac, const char *event_type,
                     const char *severity, const char *payload_json);

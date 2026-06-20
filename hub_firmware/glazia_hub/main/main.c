@@ -80,6 +80,7 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "display_init starting");
     display_init();
+    // display_wait_ready(4000);
     ESP_LOGI(TAG, "display_init queued/done");
 
     ESP_LOGI(TAG, "Hub DHT22 sensor init delayed until WiFi is connected");

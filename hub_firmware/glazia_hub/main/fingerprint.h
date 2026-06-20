@@ -60,3 +60,11 @@ typedef void (*fp_display_cb)(const char *msg);
  * Set the display callback (called by display.c during init).
  */
 void fp_set_display_cb(fp_display_cb cb);
+
+/**
+ * Called once when the enrollment task finishes (success or failure).
+ * Use this to defer work that must not run concurrently with enrollment
+ * (e.g. WebSocket TLS handshake, which causes power spikes that fail R307 flash writes).
+ */
+typedef void (*fp_enroll_done_cb)(void);
+void fp_set_enroll_done_cb(fp_enroll_done_cb cb);

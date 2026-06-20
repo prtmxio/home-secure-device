@@ -285,6 +285,21 @@ bool api_fetch_sensor_pairing(char *out_sensor_mac, char *out_provision_key_hex,
     return ok;
 }
 
+bool api_confirm_sensor(const char *sensor_mac)
+{
+    ESP_LOGI(TAG, "Confirming sensor %s with server", sensor_mac);
+    char body[64];
+    snprintf(body, sizeof(body), "{\"sensorMacAddress\":\"%s\"}", sensor_mac);
+    int status = do_post("/api/device/hubs/sensors/confirm", body, NULL, NULL);
+    bool ok = status == 200 || status == 201;
+    if (ok) {
+        ESP_LOGI(TAG, "Sensor %s confirmed on server", sensor_mac);
+    } else {
+        ESP_LOGW(TAG, "Sensor confirm failed: status=%d sensor=%s", status, sensor_mac);
+    }
+    return ok;
+}
+
 bool api_send_event(const char *sensor_mac, const char *event_type, const char *severity, const char *payload_json)
 {
     ESP_LOGI(TAG, "Sending event: %s from %s", event_type, sensor_mac);

@@ -6,6 +6,7 @@
 #include "display.h"
 #include "fingerprint.h"
 #include "nvs_storage.h"
+#include "hub_control_ws.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -18,13 +19,12 @@ static const char *TAG = "BUTTON";
 // ── Sensor pairing: 2-minute polling window ───────────────────────────────
 #define SENSOR_PAIR_TIMEOUT_MS   (2 * 60 * 1000)   // 2 minutes total
 #define SENSOR_POLL_INTERVAL_MS  3000               // check server every 3 s
-#define SENSOR_PAIR_START_STACK  4096
-#define SENSOR_POLL_STACK        4096
+#define SENSOR_POLL_STACK        8192
 
-static TimerHandle_t s_pair_timer = NULL;
-static TaskHandle_t  s_poll_task  = NULL;
-static TaskHandle_t  s_pair_start_task = NULL;
-static bool          s_pair_sensor_claimed = false;
+static TimerHandle_t  s_pair_timer          = NULL;
+static TaskHandle_t   s_poll_task           = NULL;
+static volatile bool  s_poll_busy           = false;
+static bool           s_pair_sensor_claimed = false;
 
 static void start_hub_pairing(void)
 {
@@ -45,77 +45,56 @@ static void pairing_timeout_cb(TimerHandle_t xTimer)
     }
 }
 
-// Polls GET /api/device/hubs/pending-sensor every 3 s until one sensor is
-// claimed. The remaining pairing window is reserved for the ESP-NOW handshake.
+// POSTs /sensor-pairing-mode, then polls GET /pending-sensor every 3 s.
+// Pre-allocated at button_init() — driven by xTaskNotifyGive to avoid
+// xTaskCreate failure when the TLS WebSocket holds heap during operational mode.
 static void sensor_poll_task(void *arg)
 {
     (void)arg;
-    char sensor_mac[18]    = {0};
-    char provision_key[33] = {0};
-    char sensor_name[32]   = {0};
-    char sensor_zone[32]   = {0};
-    ESP_LOGI(TAG, "Sensor pairing poll task started: interval=%d ms timeout=%d ms",
-             SENSOR_POLL_INTERVAL_MS, SENSOR_PAIR_TIMEOUT_MS);
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    while (g_mode == MODE_SENSOR_PAIRING && !s_pair_sensor_claimed) {
-        if (api_fetch_sensor_pairing(sensor_mac, provision_key,
-                                     sensor_name, sizeof(sensor_name),
-                                     sensor_zone, sizeof(sensor_zone))) {
-            ESP_LOGI(TAG, "Pending sensor received: %s. Saving provisional NVS and starting ESP-NOW", sensor_mac);
-            s_pair_sensor_claimed = true;
-            nvs_prov_save_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
-            espnow_pair_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
-            memset(provision_key, 0, sizeof(provision_key));
-            break;
-        }
+        hub_control_ws_stop();
 
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_INTERVAL_MS));
-    }
-
-    ESP_LOGI(TAG, "Sensor pairing poll task exiting, current mode=%d", g_mode);
-    s_poll_task = NULL;
-    vTaskDelete(NULL);
-}
-
-static void sensor_pairing_start_task(void *arg)
-{
-    (void)arg;
-
-    if (!api_enable_sensor_pairing()) {
-        ESP_LOGW(TAG, "Sensor pairing server window failed; returning to operational mode");
-        g_mode = MODE_OPERATIONAL;
-        s_pair_sensor_claimed = false;
-        display_show_dashboard(true);
-        s_pair_start_task = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (s_pair_timer) {
-        xTimerReset(s_pair_timer, pdMS_TO_TICKS(100));
-    }
-
-    if (s_poll_task == NULL) {
-        if (xTaskCreate(sensor_poll_task, "sensor_poll", SENSOR_POLL_STACK, NULL, 5, &s_poll_task) != pdPASS) {
-            ESP_LOGE(TAG, "Failed to create sensor pairing poll task");
-            s_poll_task = NULL;
-            if (s_pair_timer) {
-                xTimerStop(s_pair_timer, pdMS_TO_TICKS(100));
-            }
+        if (!api_enable_sensor_pairing()) {
+            ESP_LOGW(TAG, "Sensor pairing server window failed; returning to operational mode");
             g_mode = MODE_OPERATIONAL;
+            s_pair_sensor_claimed = false;
             display_show_dashboard(true);
-            s_pair_start_task = NULL;
-            vTaskDelete(NULL);
-            return;
+            s_poll_busy = false;
+            hub_control_ws_start();
+            continue;
         }
-    } else {
-        ESP_LOGI(TAG, "Sensor pairing poll task already running");
-    }
 
-    ESP_LOGI(TAG, "Sensor pairing window opened (2 min)");
-    s_pair_start_task = NULL;
-    vTaskDelete(NULL);
-    return;
+        if (s_pair_timer) {
+            xTimerReset(s_pair_timer, pdMS_TO_TICKS(100));
+        }
+        ESP_LOGI(TAG, "Sensor pairing window opened — polling every %d ms for %d ms",
+                 SENSOR_POLL_INTERVAL_MS, SENSOR_PAIR_TIMEOUT_MS);
+
+        char sensor_mac[18]    = {0};
+        char provision_key[33] = {0};
+        char sensor_name[32]   = {0};
+        char sensor_zone[32]   = {0};
+
+        while (g_mode == MODE_SENSOR_PAIRING && !s_pair_sensor_claimed) {
+            if (api_fetch_sensor_pairing(sensor_mac, provision_key,
+                                         sensor_name, sizeof(sensor_name),
+                                         sensor_zone, sizeof(sensor_zone))) {
+                ESP_LOGI(TAG, "Pending sensor received: %s. Saving provisional NVS and starting ESP-NOW", sensor_mac);
+                s_pair_sensor_claimed = true;
+                nvs_prov_save_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
+                espnow_pair_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
+                memset(provision_key, 0, sizeof(provision_key));
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_INTERVAL_MS));
+        }
+
+        ESP_LOGI(TAG, "Sensor pairing poll task idle, mode=%d", g_mode);
+        s_poll_busy = false;
+        hub_control_ws_start();
+    }
 }
 
 void sensor_pairing_open_window(void)
@@ -124,22 +103,16 @@ void sensor_pairing_open_window(void)
         ESP_LOGW(TAG, "Cannot open sensor pairing from mode %d", g_mode);
         return;
     }
-    if (s_pair_start_task != NULL) {
+    if (s_poll_busy) {
         ESP_LOGI(TAG, "Sensor pairing start already in progress");
         return;
     }
 
     g_mode = MODE_SENSOR_PAIRING;
     s_pair_sensor_claimed = false;
+    s_poll_busy = true;
     ESP_LOGI(TAG, "Mode transition: SENSOR_PAIRING");
-
-    if (xTaskCreate(sensor_pairing_start_task, "sensor_pair_start",
-                    SENSOR_PAIR_START_STACK, NULL, 5, &s_pair_start_task) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create sensor pairing start task");
-        s_pair_start_task = NULL;
-        g_mode = MODE_OPERATIONAL;
-        display_show_dashboard(true);
-    }
+    xTaskNotifyGive(s_poll_task);
 }
 
 // ── Button task ───────────────────────────────────────────────────────────
@@ -200,5 +173,6 @@ void button_init(void)
         pairing_timeout_cb
     );
 
+    xTaskCreate(sensor_poll_task, "sensor_poll", SENSOR_POLL_STACK, NULL, 5, &s_poll_task);
     xTaskCreate(button_task, "button_task", 5120, NULL, 10, NULL);
 }

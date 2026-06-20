@@ -41,6 +41,8 @@ static const char *TAG = "FINGERPRINT";
 #define R307_CMD_SEARCH 0x04
 #define R307_CMD_REG_MODEL 0x05
 #define R307_CMD_STORE 0x06
+#define R307_CMD_DELETE 0x0C
+#define R307_CMD_EMPTY 0x0D
 
 #define R307_OK 0x00
 #define R307_ERR_PACKET 0x01
@@ -74,6 +76,7 @@ typedef struct {
 
 static bool s_initialized = false;
 static fp_display_cb s_display_cb = NULL;
+static fp_enroll_done_cb s_enroll_done_cb = NULL;
 static TaskHandle_t s_enroll_task = NULL;
 
 static void fp_display(const char *msg)
@@ -439,6 +442,16 @@ esp_err_t fp_enroll(void)
     }
 
     uint16_t slot = (uint16_t)(count + 1);
+
+    if (count == 0) {
+        uint8_t confirm = r307_cmd_confirm(R307_CMD_EMPTY, NULL, 0);
+        if (confirm == R307_OK) {
+            ESP_LOGI(TAG, "R307 library cleared before first enrollment");
+        } else {
+            ESP_LOGW(TAG, "R307 library clear returned 0x%02X — continuing", confirm);
+        }
+    }
+
     while (count < FP_MAX_PRINTS) {
         esp_err_t err = fp_enroll_once(slot);
         if (err == ESP_OK) {
@@ -620,6 +633,11 @@ void fp_set_display_cb(fp_display_cb cb)
     s_display_cb = cb;
 }
 
+void fp_set_enroll_done_cb(fp_enroll_done_cb cb)
+{
+    s_enroll_done_cb = cb;
+}
+
 static void fp_enroll_task(void *arg)
 {
     (void)arg;
@@ -640,6 +658,13 @@ static void fp_enroll_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(1200));
         display_show_dashboard(true);
     }
+
+    if (s_enroll_done_cb) {
+        fp_enroll_done_cb cb = s_enroll_done_cb;
+        s_enroll_done_cb = NULL;
+        cb();
+    }
+
     s_enroll_task = NULL;
     vTaskDelete(NULL);
 }

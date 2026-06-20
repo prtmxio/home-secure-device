@@ -9,6 +9,7 @@
 #include "esp_system.h"
 #include "esp_random.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -31,27 +32,104 @@ typedef struct {
     char    payload[128];
 } __attribute__((packed)) espnow_packet_t;
 
-// ── Event forwarding queue ─────────────────────────────────────────────────
-#define EVENT_QUEUE_DEPTH 20
+// ── ESP-NOW worker queues ──────────────────────────────────────────────────
+#define EVENT_QUEUE_DEPTH   20
+#define COMMIT_QUEUE_DEPTH  4
+#define COMMIT_WORKER_STACK 3072
 
 typedef struct {
     char mac_str[18];
     char payload[128];
+    bool is_confirm;
 } event_item_t;
 
+typedef struct {
+    uint8_t mac[6];
+    char sensor_mac[18];
+    char nonce[17];
+} commit_item_t;
+
 static QueueHandle_t s_event_queue = NULL;
+static QueueHandle_t s_commit_queue = NULL;
 static TaskHandle_t  s_event_task_handle = NULL;
+static TaskHandle_t  s_commit_task_handle = NULL;
 static bool          s_espnow_ready = false;
+
+static void log_internal_heap(const char *context)
+{
+    ESP_LOGW(TAG, "%s: internal_free=%u internal_largest=%u",
+             context,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
 
 static void event_forward_task(void *arg)
 {
+    (void)arg;
     ESP_LOGI(TAG, "Event forward task started");
     event_item_t item;
     while (1) {
         if (xQueueReceive(s_event_queue, &item, portMAX_DELAY) == pdTRUE) {
+            if (item.is_confirm) {
+                ESP_LOGI(TAG, "Confirming sensor %s with server", item.mac_str);
+                api_confirm_sensor(item.mac_str);
+                continue;
+            }
+
             ESP_LOGI(TAG, "Forwarding queued event from %s to API", item.mac_str);
-            bool ok = api_send_event(item.mac_str, "sensor_data", "info", item.payload);
+
+            const char *event_type;
+            const char *severity;
+            char payload_json[128];
+
+            if (strcmp(item.payload, "door_open") == 0) {
+                event_type = "door_opened";
+                severity   = "critical";
+                snprintf(payload_json, sizeof(payload_json),
+                         "{\"module\":\"magnetic_reed\",\"reedState\":\"open\"}");
+            } else if (strcmp(item.payload, "door_close") == 0) {
+                event_type = "door_closed";
+                severity   = "info";
+                snprintf(payload_json, sizeof(payload_json),
+                         "{\"module\":\"magnetic_reed\",\"reedState\":\"closed\"}");
+            } else {
+                event_type = "sensor_data";
+                severity   = "info";
+                snprintf(payload_json, sizeof(payload_json),
+                         "{\"raw\":\"%.110s\"}", item.payload);
+            }
+
+            bool ok = api_send_event(item.mac_str, event_type, severity, payload_json);
             ESP_LOGI(TAG, "Event forward result for %s: %s", item.mac_str, ok ? "accepted" : "failed");
+        }
+    }
+}
+
+static void send_commit_retries(const commit_item_t *item)
+{
+    espnow_packet_t commit = { .type = PKT_COMMIT };
+    snprintf(commit.payload, sizeof(commit.payload), "H:%s;S:%s;N:%s",
+             g_hub_mac, item->sensor_mac, item->nonce);
+
+    for (int i = 0; i < 2; i++) {
+        esp_err_t err = esp_now_send(item->mac, (uint8_t *)&commit, sizeof(commit));
+        if (i == 0 || err != ESP_OK) {
+            ESP_LOGI(TAG, "COMMIT to %s attempt %d/2: %s",
+                     item->sensor_mac, i + 1,
+                     err == ESP_OK ? "sent" : esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+static void commit_retry_worker_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "COMMIT retry worker task started");
+    commit_item_t item;
+    while (1) {
+        if (xQueueReceive(s_commit_queue, &item, portMAX_DELAY) == pdTRUE) {
+            send_commit_retries(&item);
         }
     }
 }
@@ -64,6 +142,7 @@ typedef struct {
     uint8_t lmk[16];   // LMK = provision_key bytes
     bool    paired;    // true once ACK received
     bool    enabled;
+    bool    is_reconnect;  // true = loaded from NVS; skip server confirm on ACK
     char    name[32];
     char    zone[32];
     char    nonce[17];
@@ -182,49 +261,29 @@ static void commit_sensor_table(void)
     nvs_save_sensors(saved_macs, saved_keys, saved_names, saved_zones, saved_count);
 }
 
-typedef struct {
-    uint8_t mac[6];
-    char sensor_mac[18];
-    char nonce[17];
-} commit_retry_arg_t;
-
-static void commit_retry_task(void *arg)
+static bool queue_commit_retry(sensor_entry_t *entry, const char *sensor_mac)
 {
-    commit_retry_arg_t *a = (commit_retry_arg_t *)arg;
-    espnow_packet_t commit = { .type = PKT_COMMIT };
-    snprintf(commit.payload, sizeof(commit.payload), "H:%s;S:%s;N:%s",
-             g_hub_mac, a->sensor_mac, a->nonce);
-
-    for (int i = 0; i < 10; i++) {
-        esp_err_t err = esp_now_send(a->mac, (uint8_t *)&commit, sizeof(commit));
-        if (i == 0 || err != ESP_OK) {
-            ESP_LOGI(TAG, "COMMIT to %s attempt %d/10: %s",
-                     a->sensor_mac, i + 1, err == ESP_OK ? "sent" : esp_err_to_name(err));
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
+    if (!s_commit_queue) {
+        ESP_LOGE(TAG, "Cannot queue COMMIT for %s: COMMIT queue missing", sensor_mac);
+        log_internal_heap("COMMIT queue missing");
+        return false;
     }
 
-    free(a);
-    vTaskDelete(NULL);
-}
+    commit_item_t item = {0};
+    memcpy(item.mac, entry->mac, 6);
+    strncpy(item.sensor_mac, sensor_mac, sizeof(item.sensor_mac) - 1);
+    strncpy(item.nonce, entry->nonce, sizeof(item.nonce) - 1);
+    item.sensor_mac[sizeof(item.sensor_mac) - 1] = '\0';
+    item.nonce[sizeof(item.nonce) - 1] = '\0';
 
-static void start_commit_retry(sensor_entry_t *entry, const char *sensor_mac)
-{
-    commit_retry_arg_t *arg = malloc(sizeof(commit_retry_arg_t));
-    if (!arg) {
-        ESP_LOGE(TAG, "OOM starting COMMIT retry task");
-        return;
+    if (xQueueSend(s_commit_queue, &item, 0) != pdTRUE) {
+        ESP_LOGE(TAG, "COMMIT queue full — COMMIT not queued for %s", sensor_mac);
+        log_internal_heap("COMMIT queue full");
+        return false;
     }
-    memcpy(arg->mac, entry->mac, 6);
-    strncpy(arg->sensor_mac, sensor_mac, sizeof(arg->sensor_mac) - 1);
-    strncpy(arg->nonce, entry->nonce, sizeof(arg->nonce) - 1);
-    arg->sensor_mac[sizeof(arg->sensor_mac) - 1] = '\0';
-    arg->nonce[sizeof(arg->nonce) - 1] = '\0';
 
-    if (xTaskCreate(commit_retry_task, "commit_retry", 3072, arg, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create COMMIT retry task");
-        free(arg);
-    }
+    ESP_LOGI(TAG, "COMMIT queued for %s", sensor_mac);
+    return true;
 }
 
 // ── Receive callback ──────────────────────────────────────────────────────
@@ -279,15 +338,28 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
 
         ESP_LOGI(TAG, "Validated ACK from %s — ESP-NOW link established", mac_str);
         bool notify_on_ack = entry->notify_on_ack;
+        if (!queue_commit_retry(entry, mac_str)) {
+            ESP_LOGE(TAG, "ACK from %s validated but COMMIT could not be queued; keeping pairing provisional", mac_str);
+            return;
+        }
+
         entry->paired = true;
         entry->notify_on_ack = false;
 
         commit_sensor_table();
         nvs_prov_clear();
 
-        start_commit_retry(entry, mac_str);
+        if (!entry->is_reconnect) {
+            event_item_t citem = {0};
+            strncpy(citem.mac_str, mac_str, sizeof(citem.mac_str) - 1);
+            citem.is_confirm = true;
+            if (!s_event_queue || xQueueSend(s_event_queue, &citem, 0) != pdTRUE) {
+                ESP_LOGE(TAG, "Event queue full — sensor %s will not be confirmed on server", mac_str);
+            }
+        }
 
         display_sensor_list();
+        display_update_sensor_count();
         if (notify_on_ack) {
             char name[16];
             snprintf(name, sizeof(name), "S%d", sensor_index_from_entry(entry) + 1);
@@ -311,13 +383,11 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
             return;
         }
 
-        event_item_t item;
+        event_item_t item = {0};
         strncpy(item.mac_str, mac_str, sizeof(item.mac_str) - 1);
         strncpy(item.payload, pkt->payload, sizeof(item.payload) - 1);
-        item.mac_str[sizeof(item.mac_str) - 1] = '\0';
-        item.payload[sizeof(item.payload) - 1]  = '\0';
 
-        if (xQueueSend(s_event_queue, &item, 0) != pdTRUE) {
+        if (!s_event_queue || xQueueSend(s_event_queue, &item, 0) != pdTRUE) {
             ESP_LOGW(TAG, "Event queue full — dropping from %s", mac_str);
         } else {
             ESP_LOGI(TAG, "Event queued for API forwarding from %s", mac_str);
@@ -433,10 +503,35 @@ void espnow_init(void)
     s_event_queue = xQueueCreate(EVENT_QUEUE_DEPTH, sizeof(event_item_t));
     if (!s_event_queue) {
         ESP_LOGE(TAG, "Failed to create event queue");
+        log_internal_heap("event queue create failed");
         return;
     }
-    if (xTaskCreate(event_forward_task, "evt_fwd", 4096, NULL, 4, &s_event_task_handle) != pdPASS) {
+    if (xTaskCreate(event_forward_task, "evt_fwd", 8192, NULL, 4, &s_event_task_handle) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create event forward task");
+        log_internal_heap("event forward task create failed");
+        vQueueDelete(s_event_queue);
+        s_event_queue = NULL;
+        return;
+    }
+
+    s_commit_queue = xQueueCreate(COMMIT_QUEUE_DEPTH, sizeof(commit_item_t));
+    if (!s_commit_queue) {
+        ESP_LOGE(TAG, "Failed to create COMMIT queue");
+        log_internal_heap("COMMIT queue create failed");
+        vTaskDelete(s_event_task_handle);
+        s_event_task_handle = NULL;
+        vQueueDelete(s_event_queue);
+        s_event_queue = NULL;
+        return;
+    }
+    if (xTaskCreate(commit_retry_worker_task, "commit_retry", COMMIT_WORKER_STACK,
+                    NULL, 5, &s_commit_task_handle) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create COMMIT retry worker task");
+        log_internal_heap("COMMIT worker task create failed");
+        vQueueDelete(s_commit_queue);
+        s_commit_queue = NULL;
+        vTaskDelete(s_event_task_handle);
+        s_event_task_handle = NULL;
         vQueueDelete(s_event_queue);
         s_event_queue = NULL;
         return;
@@ -465,6 +560,14 @@ void espnow_deinit(void)
         ESP_LOGW(TAG, "esp_now_deinit failed: %s", esp_err_to_name(err));
     }
 
+    if (s_commit_task_handle) {
+        vTaskDelete(s_commit_task_handle);
+        s_commit_task_handle = NULL;
+    }
+    if (s_commit_queue) {
+        vQueueDelete(s_commit_queue);
+        s_commit_queue = NULL;
+    }
     if (s_event_task_handle) {
         vTaskDelete(s_event_task_handle);
         s_event_task_handle = NULL;
@@ -508,6 +611,7 @@ void espnow_pair_sensor(const char *sensor_mac_str, const char *provision_key_he
     hex_to_bytes(provision_key_hex, entry->lmk, 16);
     entry->paired = false;
     entry->enabled = true;
+    entry->is_reconnect = false;
     entry->notify_on_ack = true;
     strncpy(entry->name, name ? name : "", sizeof(entry->name) - 1);
     strncpy(entry->zone, zone ? zone : "", sizeof(entry->zone) - 1);
@@ -590,6 +694,7 @@ void espnow_reconnect_saved_sensors(void)
         memcpy(entry->lmk, keys[i], 16);
         entry->paired = false;   // will be set true on ACK
         entry->enabled = nvs_load_sensor_enabled(i, true);
+        entry->is_reconnect = true;
         entry->notify_on_ack = false;
         strncpy(entry->name, names[i], sizeof(entry->name) - 1);
         strncpy(entry->zone, zones[i], sizeof(entry->zone) - 1);

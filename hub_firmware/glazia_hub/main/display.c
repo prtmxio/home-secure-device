@@ -56,7 +56,7 @@ static const char *TAG = "DISPLAY";
 #define LCD_PIXEL_CLK_HZ   (10 * 1000 * 1000)
 #define LCD_CMD_BITS       8
 #define LCD_PARAM_BITS     8
-#define DRAW_BUF_LINES     8
+#define DRAW_BUF_LINES     4
 
 /* ── Display-side theme aliases ─────────────────────────────────────────── */
 #define C_CYAN_U32   UI_COLOR_VIOLET
@@ -498,6 +498,7 @@ static esp_err_t lcd_hw_init(void)
     /* Hand off to LVGL port */
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     port_cfg.task_stack = 8192;
+    port_cfg.task_affinity = 1;
     ESP_LOGI(TAG, "Display init: LVGL port init");
     err = lvgl_port_init(&port_cfg);
     if (err != ESP_OK) {
@@ -515,11 +516,14 @@ static esp_err_t lcd_hw_init(void)
         .monochrome    = false,
         .flags         = { .buff_dma = true },
     };
-    ESP_LOGI(TAG, "Display init: adding LVGL display, free internal heap=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "Display init: adding LVGL display, internal_free=%u internal_largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     s_lvgl_disp = lvgl_port_add_disp(&disp_cfg);
     if (!s_lvgl_disp) {
-        ESP_LOGE(TAG, "Display init: lvgl_port_add_disp returned NULL");
+        ESP_LOGE(TAG, "Display init: lvgl_port_add_disp returned NULL, internal_free=%u internal_largest=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "Display init: LVGL display registered");
@@ -1351,7 +1355,7 @@ static void display_init_task(void *arg)
     (void)arg;
 
     ESP_LOGI(TAG, "Display init task started");
-    vTaskDelay(pdMS_TO_TICKS(2500));
+    vTaskDelay(pdMS_TO_TICKS(500));
     esp_err_t err = lcd_hw_init();
     if (err != ESP_OK) {
         s_display_state = DISPLAY_FAILED;
@@ -1406,7 +1410,7 @@ void display_init(void)
     }
 
     s_display_state = DISPLAY_STARTING;
-    if (xTaskCreate(display_init_task, "display_init", 8192, NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(display_init_task, "display_init", 8192, NULL, tskIDLE_PRIORITY + 1, NULL, 1) != pdPASS) {
         s_display_state = DISPLAY_FAILED;
         ESP_LOGE(TAG, "Display init: failed to create display init task");
         return;
@@ -1577,6 +1581,17 @@ void display_sensor_location(const char *mac_str)
 void display_sensor_list(void)
 {
     display_refresh_sensor_nodes();
+}
+
+void display_update_sensor_count(void)
+{
+    if (!display_is_ready() || !s_ui_online) return;
+    if (!lvgl_port_lock(pdMS_TO_TICKS(500))) return;
+    int n = espnow_get_sensor_count();
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%d sensor node%s active", n, n == 1 ? "" : "s");
+    set_label_locked(objects.sensor_info, buf);
+    lvgl_port_unlock();
 }
 
 void display_show_dashboard(bool online)
