@@ -200,6 +200,13 @@ void wifi_connect(const char *ssid, const char *password)
         ESP_LOGI(TAG, "WiFi step done: esp_wifi_set_max_tx_power");
     }
 
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(NONE) failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "WiFi modem sleep disabled");
+    }
+
     ESP_LOGI(TAG, "WiFi step: wait for connect/fail");
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -304,6 +311,7 @@ bool wifi_resume_from_offline_mode(void)
         return false;
     }
 
+    esp_wifi_set_ps(WIFI_PS_NONE);
     espnow_init();
     espnow_reconnect_saved_sensors();
     g_mode = MODE_OPERATIONAL;

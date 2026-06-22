@@ -342,7 +342,7 @@ esp_err_t hub_control_ws_start(void)
         .task_name         = "hub_ws",
         .task_stack = 6144,
         .buffer_size = 1024,
-        .network_timeout_ms = 10000,
+        .network_timeout_ms = 20000,
         .reconnect_timeout_ms = 5000,
         .ping_interval_sec = 20,
         .pingpong_timeout_sec = 10,

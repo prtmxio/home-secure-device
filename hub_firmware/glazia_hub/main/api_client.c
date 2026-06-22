@@ -137,6 +137,7 @@ static inline int do_get(const char *path)
 // ── Public API ─────────────────────────────────────────────────────────────
 
 void api_register_hub(void)
+
 {
     size_t token_len = strlen(g_provisioning_token);
     ESP_LOGI(TAG, "Registering hub mac=%s token_len=%u", g_hub_mac, (unsigned)token_len);

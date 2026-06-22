@@ -38,9 +38,10 @@ typedef struct {
 #define COMMIT_WORKER_STACK 3072
 
 typedef struct {
-    char mac_str[18];
-    char payload[128];
-    bool is_confirm;
+    char    mac_str[18];
+    char    payload[128];
+    bool    is_confirm;
+    uint8_t retry_count;
 } event_item_t;
 
 typedef struct {
@@ -100,7 +101,19 @@ static void event_forward_task(void *arg)
             }
 
             bool ok = api_send_event(item.mac_str, event_type, severity, payload_json);
-            ESP_LOGI(TAG, "Event forward result for %s: %s", item.mac_str, ok ? "accepted" : "failed");
+            if (ok) {
+                ESP_LOGI(TAG, "Event forward result for %s: accepted", item.mac_str);
+            } else if (item.retry_count < 3) {
+                item.retry_count++;
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                if (!s_event_queue || xQueueSend(s_event_queue, &item, 0) != pdTRUE) {
+                    ESP_LOGW(TAG, "Event retry queue full for %s — dropping", item.mac_str);
+                } else {
+                    ESP_LOGI(TAG, "Event re-queued (retry %d/3) for %s", item.retry_count, item.mac_str);
+                }
+            } else {
+                ESP_LOGW(TAG, "Event max retries reached for %s — dropping", item.mac_str);
+            }
         }
     }
 }
