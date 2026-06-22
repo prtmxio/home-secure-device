@@ -123,7 +123,7 @@ static display_cache_t s_display_cache = {
 };
 
 void display_fingerprint_status(const char *message);
-static void create_sensor_row(lv_obj_t *parent, int index, const char *name, bool enabled);
+static void create_sensor_row(lv_obj_t *parent, int index, const char *name, bool enabled, bool paired);
 static void display_init_task(void *arg);
 static esp_err_t lcd_hw_init(void);
 static void load_screen_locked(enum ScreensEnum screen);
@@ -807,7 +807,7 @@ static void set_hub_connection_status_locked(bool online)
         set_label_locked(objects.hub_status, "Online");
         set_label_locked(objects.hub_location, hub_location_text_locked());
 
-        int n = espnow_get_sensor_count();
+        int n = espnow_get_active_sensor_count();
         char info_buf[64];
         snprintf(info_buf, sizeof(info_buf), "%d sensor node%s active", n, n == 1 ? "" : "s");
         set_label_locked(objects.sensor_info, info_buf);
@@ -1201,7 +1201,7 @@ static void sensor_switch_cb(lv_event_t *e)
     espnow_set_sensor_enabled(index, enabled);
 }
 
-static void create_sensor_row(lv_obj_t *parent, int index, const char *name, bool enabled)
+static void create_sensor_row(lv_obj_t *parent, int index, const char *name, bool enabled, bool paired)
 {
     lv_obj_t *row = lv_obj_create(parent);
     lv_obj_set_pos(row, 8, 4 + index * 50);
@@ -1228,7 +1228,10 @@ static void create_sensor_row(lv_obj_t *parent, int index, const char *name, boo
     lv_obj_t *label = lv_label_create(row);
     lv_label_set_text(label, name);
     lv_obj_set_style_text_font(label, &lv_font_montserrat_10, LV_PART_MAIN);
-    lv_obj_set_style_text_color(label, lv_color_hex(enabled ? UI_COLOR_TEXT_PRIMARY : UI_COLOR_TEXT_DIM), LV_PART_MAIN);
+    uint32_t label_color = !enabled ? UI_COLOR_TEXT_DIM
+                         : paired   ? UI_COLOR_TEXT_PRIMARY
+                                    : C_AMBER_U32;
+    lv_obj_set_style_text_color(label, lv_color_hex(label_color), LV_PART_MAIN);
     lv_obj_set_pos(label, 52, 16);
     lv_obj_set_size(label, 100, 14);
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
@@ -1309,6 +1312,8 @@ static void configure_screen_locked(enum ScreensEnum screen)
     case SCREEN_ID_SENSOR_NODES_SETTING:
         make_back_touch_target(objects.obj44);
         make_touch_target_tree(objects.add_sensor_button);
+        if (objects.add_sensor_button)
+            lv_obj_set_ext_click_area(objects.add_sensor_button, 0);
         if (objects.settings_menu_cont_1) {
             lv_obj_set_scroll_dir(objects.settings_menu_cont_1, LV_DIR_VER);
             lv_obj_set_scrollbar_mode(objects.settings_menu_cont_1, LV_SCROLLBAR_MODE_ACTIVE);
@@ -1440,7 +1445,7 @@ static void refresh_sensor_nodes_locked(void)
         bool enabled = true;
         bool paired = false;
         if (espnow_get_sensor_info(i, name, sizeof(name), &enabled, &paired)) {
-            create_sensor_row(objects.settings_menu_cont_1, i, name, enabled);
+            create_sensor_row(objects.settings_menu_cont_1, i, name, enabled, paired);
         }
     }
 }
@@ -1587,7 +1592,7 @@ void display_update_sensor_count(void)
 {
     if (!display_is_ready() || !s_ui_online) return;
     if (!lvgl_port_lock(pdMS_TO_TICKS(500))) return;
-    int n = espnow_get_sensor_count();
+    int n = espnow_get_active_sensor_count();
     char buf[64];
     snprintf(buf, sizeof(buf), "%d sensor node%s active", n, n == 1 ? "" : "s");
     set_label_locked(objects.sensor_info, buf);

@@ -28,6 +28,7 @@ void espnow_reconnect_saved_sensors(void);
 void espnow_get_sensor_list_str(char *out, size_t out_len);
 
 int espnow_get_sensor_count(void);
+int espnow_get_active_sensor_count(void);
 bool espnow_get_sensor_info(int index, char *out_name, size_t out_name_len, bool *out_enabled, bool *out_paired);
 void espnow_set_sensor_enabled(int index, bool enabled);
 

@@ -168,6 +168,8 @@ static int            s_sensor_count = 0;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+static void send_pkt_reset(const uint8_t *mac);  // defined below public API
+
 static void mac_str_to_bytes(const char *mac_str, uint8_t *mac_bytes)
 {
     sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
@@ -550,6 +552,8 @@ static void reconnect_manager_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
+    display_sensor_list();
+    display_update_sensor_count();
     ESP_LOGI(TAG, "Reconnect manager task done");
     vTaskDelete(NULL);
 }
@@ -826,6 +830,15 @@ int espnow_get_sensor_count(void)
     return s_sensor_count;
 }
 
+int espnow_get_active_sensor_count(void)
+{
+    int count = 0;
+    for (int i = 0; i < s_sensor_count; i++) {
+        if (s_sensors[i].enabled && s_sensors[i].paired) count++;
+    }
+    return count;
+}
+
 bool espnow_get_sensor_info(int index, char *out_name, size_t out_name_len, bool *out_enabled, bool *out_paired)
 {
     if (index < 0 || index >= s_sensor_count) return false;
@@ -846,9 +859,41 @@ bool espnow_get_sensor_info(int index, char *out_name, size_t out_name_len, bool
 void espnow_set_sensor_enabled(int index, bool enabled)
 {
     if (index < 0 || index >= s_sensor_count) return;
-    s_sensors[index].enabled = enabled;
+    sensor_entry_t *entry = &s_sensors[index];
+
+    if (entry->enabled == enabled) return;
+
+    entry->enabled = enabled;
     nvs_save_sensor_enabled(index, enabled);
-    ESP_LOGI(TAG, "Sensor S%d %s", index + 1, enabled ? "enabled" : "disabled");
+
+    if (!enabled) {
+        esp_now_del_peer(entry->mac);
+        entry->paired = false;
+        ESP_LOGI(TAG, "Sensor S%d disabled and disconnected", index + 1);
+    } else {
+        if (!esp_now_is_peer_exist(entry->mac)) {
+            esp_now_peer_info_t peer = {};
+            memcpy(peer.peer_addr, entry->mac, 6);
+            peer.channel = 0;
+            peer.encrypt = true;
+            memcpy(peer.lmk, entry->lmk, 16);
+            esp_err_t err = esp_now_add_peer(&peer);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to re-add peer for S%d: %s", index + 1, esp_err_to_name(err));
+                entry->enabled = false;
+                nvs_save_sensor_enabled(index, false);
+                return;
+            }
+        }
+        entry->is_reconnect = true;
+        entry->notify_on_ack = false;
+        entry->nonce[0] = '\0';
+        start_hello_retry(entry, 150, true);
+        ESP_LOGI(TAG, "Sensor S%d re-enabled, reconnect started", index + 1);
+    }
+
+    display_sensor_list();
+    display_update_sensor_count();
 }
 
 static void send_pkt_reset(const uint8_t *mac)
