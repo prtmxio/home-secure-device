@@ -13,7 +13,6 @@
 #include "esp_websocket_client.h"
 #include "espnow.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "nvs_storage.h"
 #include "state.h"
@@ -22,12 +21,6 @@ static const char *TAG = "HUB_WS";
 
 static esp_websocket_client_handle_t s_client;
 static bool s_started;
-static QueueHandle_t s_username_queue;
-static TaskHandle_t s_username_task;
-
-typedef struct {
-    char name[64];
-} username_update_t;
 
 static const char *message_user_name(cJSON *root)
 {
@@ -46,57 +39,6 @@ static const char *message_user_name(cJSON *root)
     }
 
     return cJSON_IsString(name) && name->valuestring ? name->valuestring : NULL;
-}
-
-static void username_update_task(void *arg)
-{
-    (void)arg;
-    username_update_t update;
-
-    while (xQueueReceive(s_username_queue, &update, portMAX_DELAY) == pdTRUE) {
-        if (update.name[0] == '\0' || strcmp(update.name, g_user_name) == 0) {
-            continue;
-        }
-
-        strncpy(g_user_name, update.name, sizeof(g_user_name) - 1);
-        g_user_name[sizeof(g_user_name) - 1] = '\0';
-        nvs_save_credentials();
-        display_user_name(g_user_name);
-        ESP_LOGI(TAG, "Dashboard username updated from control websocket");
-    }
-}
-
-static esp_err_t ensure_username_worker(void)
-{
-    if (s_username_queue && s_username_task) {
-        return ESP_OK;
-    }
-
-    s_username_queue = xQueueCreate(1, sizeof(username_update_t));
-    if (!s_username_queue) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (xTaskCreatePinnedToCore(username_update_task, "hub_ws_user", 2048, NULL, 4,
-                                &s_username_task, 0) != pdPASS) {
-        vQueueDelete(s_username_queue);
-        s_username_queue = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-
-    return ESP_OK;
-}
-
-static void queue_username_update(cJSON *root)
-{
-    const char *name = message_user_name(root);
-    if (!name || name[0] == '\0' || !s_username_queue) {
-        return;
-    }
-
-    username_update_t update = {0};
-    strncpy(update.name, name, sizeof(update.name) - 1);
-    xQueueOverwrite(s_username_queue, &update);
 }
 
 void hub_control_ws_send_camera_status(const char *stream_session_id,
@@ -258,7 +200,15 @@ static void handle_ws_text(const char *data, int len)
     if (cJSON_IsString(type) && type->valuestring) {
         if (strcmp(type->valuestring, "ready") == 0) {
             ESP_LOGI(TAG, "Control websocket ready");
-            queue_username_update(root);
+            const char *name = message_user_name(root);
+            if (name && name[0] != '\0' && strcmp(name, g_user_name) != 0) {
+                strncpy(g_user_name, name, sizeof(g_user_name) - 1);
+                g_user_name[sizeof(g_user_name) - 1] = '\0';
+                nvs_save_credentials();
+                display_user_name(g_user_name);
+                ESP_LOGI(TAG, "Username updated from ready event");
+            }
+            espnow_queue_hub_event("hub_online");
         } else if (strcmp(type->valuestring, "door_lock_command") == 0) {
             handle_door_lock_command(root);
         } else if (strcmp(type->valuestring, "camera_stream_command") == 0) {
@@ -317,13 +267,7 @@ esp_err_t hub_control_ws_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    esp_err_t err = ensure_username_worker();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start username update worker: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = door_lock_start(send_door_lock_ack);
+    esp_err_t err = door_lock_start(send_door_lock_ack);
     if (err != ESP_OK) return err;
 
     static char uri[160];

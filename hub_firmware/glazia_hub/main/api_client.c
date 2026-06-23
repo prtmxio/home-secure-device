@@ -25,25 +25,6 @@ static char              s_evt_resp_buf[256];
 static int               s_evt_resp_len = 0;
 static SemaphoreHandle_t s_evt_mutex   = NULL;
 
-static const char *response_user_name(cJSON *root)
-{
-    cJSON *user = cJSON_GetObjectItem(root, "user");
-    cJSON *owner = cJSON_GetObjectItem(root, "owner");
-    cJSON *name = NULL;
-
-    if (cJSON_IsObject(user)) {
-        name = cJSON_GetObjectItem(user, "name");
-    }
-    if (!cJSON_IsString(name) && cJSON_IsObject(owner)) {
-        name = cJSON_GetObjectItem(owner, "name");
-    }
-    if (!cJSON_IsString(name)) {
-        name = cJSON_GetObjectItem(root, "userName");
-    }
-
-    return cJSON_IsString(name) && name->valuestring ? name->valuestring : NULL;
-}
-
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     if (evt->event_id == HTTP_EVENT_ON_DATA) {
@@ -252,12 +233,6 @@ void api_register_hub(void)
                 ESP_LOGW(TAG, "Registration response missing home name; expected home.name or homeName");
             }
 
-            const char *user_name = response_user_name(root);
-            if (user_name && user_name[0] != '\0') {
-                strncpy(g_user_name, user_name, sizeof(g_user_name) - 1);
-                g_user_name[sizeof(g_user_name) - 1] = '\0';
-            }
-
             cJSON_Delete(root);
         }
 
@@ -369,6 +344,21 @@ bool api_confirm_sensor(const char *sensor_mac)
         ESP_LOGI(TAG, "Sensor %s confirmed on server", sensor_mac);
     } else {
         ESP_LOGW(TAG, "Sensor confirm failed: status=%d sensor=%s", status, sensor_mac);
+    }
+    return ok;
+}
+
+bool api_send_hub_event(const char *event_type)
+{
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"eventType\":\"%s\",\"severity\":\"info\","
+             "\"payload\":{\"firmwareVersion\":\"%s\"}}",
+             event_type, HUB_FIRMWARE_VERSION);
+    int status = do_event_request("/api/device/hubs/events", body);
+    bool ok = status == 200 || status == 201 || status == 202;
+    if (!ok) {
+        ESP_LOGW(TAG, "Hub event '%s' failed: status=%d", event_type, status);
     }
     return ok;
 }

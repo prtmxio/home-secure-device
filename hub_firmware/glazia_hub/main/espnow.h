@@ -40,3 +40,7 @@ esp_err_t espnow_remove_sensor(const char *sensor_mac_str);
 // Send PKT_RESET to every currently-paired sensor peer (best-effort, no retry).
 // Call before hub NVS erase/restart so sensors can clear their own NVS.
 void espnow_send_reset_to_all_sensors(void);
+
+// Queue a hub-level event (no sensor MAC) to be forwarded to the server.
+// Safe to call from any task — non-blocking xQueueSend.
+void espnow_queue_hub_event(const char *event_type);

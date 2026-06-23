@@ -41,6 +41,8 @@ typedef struct {
     char    mac_str[18];
     char    payload[128];
     bool    is_confirm;
+    bool    is_hub_event;
+    int8_t  rssi;
     uint8_t retry_count;
 } event_item_t;
 
@@ -71,6 +73,12 @@ static void event_forward_task(void *arg)
     event_item_t item;
     while (1) {
         if (xQueueReceive(s_event_queue, &item, portMAX_DELAY) == pdTRUE) {
+            if (item.is_hub_event) {
+                ESP_LOGI(TAG, "Forwarding hub event '%s' to API", item.payload);
+                api_send_hub_event(item.payload);
+                continue;
+            }
+
             if (item.is_confirm) {
                 ESP_LOGI(TAG, "Confirming sensor %s with server", item.mac_str);
                 api_confirm_sensor(item.mac_str);
@@ -87,12 +95,14 @@ static void event_forward_task(void *arg)
                 event_type = "door_opened";
                 severity   = "critical";
                 snprintf(payload_json, sizeof(payload_json),
-                         "{\"module\":\"magnetic_reed\",\"reedState\":\"open\"}");
+                         "{\"module\":\"magnetic_reed\",\"reedState\":\"open\","
+                         "\"batteryPercent\":100,\"rssi\":%d}", (int)item.rssi);
             } else if (strcmp(item.payload, "door_close") == 0) {
                 event_type = "door_closed";
                 severity   = "info";
                 snprintf(payload_json, sizeof(payload_json),
-                         "{\"module\":\"magnetic_reed\",\"reedState\":\"closed\"}");
+                         "{\"module\":\"magnetic_reed\",\"reedState\":\"closed\","
+                         "\"batteryPercent\":100,\"rssi\":%d}", (int)item.rssi);
             } else {
                 event_type = "sensor_data";
                 severity   = "info";
@@ -402,6 +412,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
         event_item_t item = {0};
         strncpy(item.mac_str, mac_str, sizeof(item.mac_str) - 1);
         strncpy(item.payload, pkt->payload, sizeof(item.payload) - 1);
+        item.rssi = recv_info->rx_ctrl->rssi;
 
         if (!s_event_queue || xQueueSend(s_event_queue, &item, 0) != pdTRUE) {
             ESP_LOGW(TAG, "Event queue full — dropping from %s", mac_str);
@@ -937,5 +948,19 @@ void espnow_send_reset_to_all_sensors(void)
     }
     if (s_sensor_count > 0) {
         vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void espnow_queue_hub_event(const char *event_type)
+{
+    if (!s_event_queue) {
+        ESP_LOGW(TAG, "Hub event '%s' dropped — event queue not ready", event_type);
+        return;
+    }
+    event_item_t item = {0};
+    item.is_hub_event = true;
+    strncpy(item.payload, event_type, sizeof(item.payload) - 1);
+    if (xQueueSend(s_event_queue, &item, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Hub event queue full — dropping '%s'", event_type);
     }
 }

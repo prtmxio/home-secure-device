@@ -29,6 +29,9 @@ extern char g_user_name[64];
 extern char g_pending_sensor_mac[18];    // e.g. "AA:BB:CC:DD:EE:FF"
 extern char g_pending_provision_key[33]; // 32-char hex of 16-byte LMK
 
+// ── Firmware Version ──────────────────────────────────────────────────────
+#define HUB_FIRMWARE_VERSION "1.0.0"
+
 // ── Server Config ─────────────────────────────────────────────────────────
 #define SERVER_IP      "home-secure.glazia.in"
 #define SERVER_PORT    443
