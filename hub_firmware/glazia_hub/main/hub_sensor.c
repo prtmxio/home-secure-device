@@ -18,7 +18,7 @@
 static const char *TAG = "HUB_SENSOR";
 
 #define HUB_DHT22_GPIO              GPIO_NUM_3
-#define HUB_SENSOR_TASK_STACK       2048
+#define HUB_SENSOR_TASK_STACK       3072
 #define HUB_SENSOR_TASK_PRIORITY    4
 #define HUB_SENSOR_SAMPLE_MS        2000
 #define HUB_SENSOR_WINDOW_SIZE      3

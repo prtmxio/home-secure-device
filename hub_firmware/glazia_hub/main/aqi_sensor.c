@@ -12,7 +12,7 @@ static const char *TAG = "AQI_SENSOR";
 
 #define MQ135_ADC_UNIT          ADC_UNIT_2
 #define MQ135_ADC_CHANNEL       ADC_CHANNEL_9
-#define AQI_TASK_STACK          2048
+#define AQI_TASK_STACK          3072
 #define AQI_TASK_PRIORITY       4
 #define AQI_WARMUP_MS           10000
 #define AQI_SAMPLE_COUNT        20
