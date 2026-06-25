@@ -17,9 +17,10 @@
 static const char *TAG = "BUTTON";
 
 // ── Sensor pairing: 2-minute polling window ───────────────────────────────
-#define SENSOR_PAIR_TIMEOUT_MS   (2 * 60 * 1000)   // 2 minutes total
-#define SENSOR_POLL_INTERVAL_MS  3000               // check server every 3 s
-#define SENSOR_POLL_STACK        6144
+#define SENSOR_PAIR_TIMEOUT_MS        (2 * 60 * 1000)   // 2 minutes total
+#define SENSOR_POLL_INTERVAL_MS       3000               // check server every 3 s
+#define SENSOR_POLL_STACK             6144
+#define SENSOR_PAIR_ESPNOW_MIN_WAIT_MS 15000             // grace period for sensor BLE provisioning
 
 static TimerHandle_t  s_pair_timer          = NULL;
 static TaskHandle_t   s_poll_task           = NULL;
@@ -69,6 +70,7 @@ static void sensor_poll_task(void *arg)
         if (s_pair_timer) {
             xTimerReset(s_pair_timer, pdMS_TO_TICKS(100));
         }
+        TickType_t s_open_tick = xTaskGetTickCount();
         ESP_LOGI(TAG, "Sensor pairing window opened — polling every %d ms for %d ms",
                  SENSOR_POLL_INTERVAL_MS, SENSOR_PAIR_TIMEOUT_MS);
 
@@ -81,9 +83,19 @@ static void sensor_poll_task(void *arg)
             if (api_fetch_sensor_pairing(sensor_mac, provision_key,
                                          sensor_name, sizeof(sensor_name),
                                          sensor_zone, sizeof(sensor_zone))) {
-                ESP_LOGI(TAG, "Pending sensor received: %s. Saving provisional NVS and starting ESP-NOW", sensor_mac);
+                ESP_LOGI(TAG, "Pending sensor received: %s. Saving provisional NVS", sensor_mac);
                 s_pair_sensor_claimed = true;
                 nvs_prov_save_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
+
+                TickType_t elapsed = xTaskGetTickCount() - s_open_tick;
+                TickType_t min_ticks = pdMS_TO_TICKS(SENSOR_PAIR_ESPNOW_MIN_WAIT_MS);
+                if (elapsed < min_ticks) {
+                    ESP_LOGI(TAG, "Waiting %lu ms before ESP-NOW (sensor BLE provision grace period)",
+                             (unsigned long)pdTICKS_TO_MS(min_ticks - elapsed));
+                    vTaskDelay(min_ticks - elapsed);
+                }
+
+                ESP_LOGI(TAG, "Starting ESP-NOW pairing for %s", sensor_mac);
                 espnow_pair_sensor(sensor_mac, provision_key, sensor_name, sensor_zone);
                 memset(provision_key, 0, sizeof(provision_key));
                 break;

@@ -233,6 +233,12 @@ void api_register_hub(void)
                 ESP_LOGW(TAG, "Registration response missing home name; expected home.name or homeName");
             }
 
+            cJSON *uname = cJSON_GetObjectItem(root, "userName");
+            if (cJSON_IsString(uname) && uname->valuestring) {
+                strncpy(g_user_name, uname->valuestring, sizeof(g_user_name) - 1);
+                g_user_name[sizeof(g_user_name) - 1] = '\0';
+            }
+
             cJSON_Delete(root);
         }
 

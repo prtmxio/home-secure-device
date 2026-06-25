@@ -591,13 +591,15 @@ void create_screen_add_another__sensor()
     add_nav_title(obj, "Add Sensor", UI_COLOR_AMBER, &objects.obj55);
 
     lv_obj_t *card_obj = card(obj, PAGE_X, 58, PAGE_W, 206, 13);
-    lv_obj_t *qr = lv_qrcode_create(card_obj, 160, lv_color_black(), lv_color_white());
-    lv_obj_set_pos(qr, 32, 12);
-    lv_obj_clear_flag(qr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_qrcode_update(qr, g_hub_mac, (uint32_t)strlen(g_hub_mac));
-    label(card_obj, "Scan QR to add sensor", 0, 176, PAGE_W, 12,
+    lv_obj_t *add_logo = lv_img_create(card_obj);
+    lv_img_set_src(add_logo, &img_gz_logo);
+    lv_img_set_zoom(add_logo, 200);
+    lv_obj_align(add_logo, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_clear_flag(add_logo, LV_OBJ_FLAG_SCROLLABLE);
+    label(card_obj, "Open the Glazia app\nand scan your sensor's QR code",
+          12, 126, PAGE_W - 24, 36,
           &lv_font_montserrat_10, UI_COLOR_TEXT_SECONDARY,
-          LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_CLIP);
+          LV_TEXT_ALIGN_CENTER, LV_LABEL_LONG_WRAP);
 
     objects.added_sensor_data = card(obj, PAGE_X, 58, PAGE_W, 206, 13);
     lv_obj_add_flag(objects.added_sensor_data, LV_OBJ_FLAG_HIDDEN);
